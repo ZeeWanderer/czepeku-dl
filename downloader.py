@@ -9,6 +9,7 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 import http.client
 from requests.exceptions import ChunkedEncodingError
+import shutil
 
 SERVICE = "patreon"
 USER_ID = "16010661"
@@ -20,6 +21,9 @@ REPOSITORY_DIR = "maps_repository"
 
 
 def setup_logging():
+    """
+    Configures the root logger to output debug and higher level logs to both a file and the console.
+    """
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -31,6 +35,12 @@ def setup_logging():
 
 
 def load_cookies():
+    """
+    Loads cookies from COOKIE_FILE into a requests.Session with retry logic.
+
+    Returns:
+        requests.Session: A session object with loaded cookies and retry-enabled adapters.
+    """
     logger = logging.getLogger('load_cookies')
     logger.debug(f"Looking for cookie file at {COOKIE_FILE}")
     if not os.path.exists(COOKIE_FILE):
@@ -49,6 +59,12 @@ def load_cookies():
 
 
 def load_downloaded_list():
+    """
+    Loads the set of already downloaded file identifiers from DOWNLOADED_LIST_FILE.
+
+    Returns:
+        set: A set of downloaded file paths or identifiers.
+    """
     logger = logging.getLogger('load_downloaded_list')
     if os.path.exists(DOWNLOADED_LIST_FILE):
         try:
@@ -64,6 +80,16 @@ def load_downloaded_list():
 
 
 def fetch_post_data(session, post_id):
+    """
+    Fetches JSON data for a specific post from the kemono API.
+
+    Args:
+        session (requests.Session): The HTTP session with cookies and retries configured.
+        post_id (str): The identifier of the post to fetch.
+
+    Returns:
+        dict or None: Parsed JSON response if successful, otherwise None.
+    """
     logger = logging.getLogger('fetch_post_data')
     url = f"https://kemono.su/api/v1/{SERVICE}/user/{USER_ID}/post/{post_id}"
     logger.debug(f"Fetching post data from {url}")
@@ -78,6 +104,17 @@ def fetch_post_data(session, post_id):
 
 
 def download_file(session, url, path):
+    """
+    Downloads a file from the given URL to the specified local path, supporting resume on failure.
+
+    Args:
+        session (requests.Session): The HTTP session for downloading.
+        url (str): The remote file URL.
+        path (str): The local file path to save the download to.
+
+    Returns:
+        bool: True if download completed successfully, False otherwise.
+    """
     logger = logging.getLogger('download_file')
     logger.info(f"Starting download: {url}")
     temp_path = path + '.part'
@@ -134,7 +171,15 @@ def download_file(session, url, path):
 
 def extract_archive(file_path, extract_dir):
     """
-    Extracts .zip archives. Recursively extracts nested archives and removes them.
+    Extracts ZIP archives to the target directory, removes the archive, and cleans up __MACOSX folders.
+    Recursively processes nested ZIP files.
+
+    Args:
+        file_path (str): Path to the ZIP archive.
+        extract_dir (str): Directory to extract contents into.
+
+    Returns:
+        bool: True if extraction succeeded, False otherwise.
     """
     logger = logging.getLogger('extract_archive')
     base, ext = os.path.splitext(file_path.lower())
@@ -152,14 +197,26 @@ def extract_archive(file_path, extract_dir):
     except Exception as e:
         logger.error(f"Extraction failed for {file_path}: {e}")
         return False
+
     try:
         os.remove(file_path)
         logger.debug(f"Removed archive {file_path} after extraction")
     except OSError as e:
         logger.warning(f"Could not remove archive {file_path}: {e}")
+
+    for root, dirs, _ in os.walk(extract_dir):
+        for d in dirs:
+            if d == '__MACOSX':
+                macosx_path = os.path.join(root, d)
+                try:
+                    shutil.rmtree(macosx_path)
+                    logger.debug(f"Removed __MACOSX directory {macosx_path}")
+                except Exception as e:
+                    logger.warning(f"Could not remove __MACOSX directory {macosx_path}: {e}")
+
     for root, _, files in os.walk(extract_dir):
         for fname in files:
-            if fname.lower().endswith(('.zip')):
+            if fname.lower().endswith('.zip'):
                 nested = os.path.join(root, fname)
                 if nested != file_path:
                     extract_archive(nested, root)
@@ -167,6 +224,12 @@ def extract_archive(file_path, extract_dir):
 
 
 def save_downloaded_list(dl):
+    """
+    Persists the set of downloaded file identifiers to DOWNLOADED_LIST_FILE using pickle.
+
+    Args:
+        dl (set): The set of downloaded file paths or identifiers.
+    """
     logger = logging.getLogger('save_downloaded_list')
     try:
         with open(DOWNLOADED_LIST_FILE, 'wb') as f:
@@ -177,6 +240,15 @@ def save_downloaded_list(dl):
 
 
 def process_attachments(session, post_data, pid, dl):
+    """
+    Downloads and extracts new .zip attachments from post data, skipping already downloaded items.
+
+    Args:
+        session (requests.Session): The HTTP session for downloading.
+        post_data (dict): JSON data for the post containing attachments.
+        pid (str): Post identifier, used for logging.
+        dl (set): Set of already downloaded file paths or identifiers.
+    """
     logger = logging.getLogger('process_attachments')
     logger.debug(f"Processing attachments for post {pid}")
     for att in post_data.get('attachments', []):
@@ -203,16 +275,23 @@ def process_attachments(session, post_data, pid, dl):
 
 
 def process_existing_archives():
+    """
+    Scans and extracts any .zip files already present in the REPOSITORY_DIR, including nested archives.
+    """
     logger = logging.getLogger('process_existing_archives')
     logger.info(f"Scanning {REPOSITORY_DIR} for existing archives")
     for root, _, files in os.walk(REPOSITORY_DIR):
         for fname in files:
-            if fname.lower().endswith(('.zip')):
+            if fname.lower().endswith('.zip'):
                 path = os.path.join(root, fname)
                 extract_archive(path, root)
 
 
 def main():
+    """
+    Main entry point for the Patreon downloader. Initializes logging, loads cookies and state,
+    ensures directories exist, processes existing archives, and iterates through specified posts.
+    """
     setup_logging()
     logger = logging.getLogger('main')
     logger.info("Starting Patreon downloader script")
