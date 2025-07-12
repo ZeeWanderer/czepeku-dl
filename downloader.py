@@ -132,20 +132,38 @@ def download_file(session, url, path):
     return True
 
 
-def extract_zip(file_path, extract_dir):
-    logger = logging.getLogger('extract_zip')
-    logger.info(f"Extracting {file_path} to {extract_dir}")
-    if not zipfile.is_zipfile(file_path):
-        logger.error(f"{file_path} is not a zip file")
-        return False
+def extract_archive(file_path, extract_dir):
+    """
+    Extracts .zip archives. Recursively extracts nested archives and removes them.
+    """
+    logger = logging.getLogger('extract_archive')
+    base, ext = os.path.splitext(file_path.lower())
     try:
-        with zipfile.ZipFile(file_path, 'r') as z:
-            z.extractall(extract_dir)
-        logger.info(f"Extraction successful for {file_path}")
-        return True
+        if ext == '.zip':
+            logger.info(f"Extracting ZIP {file_path} to {extract_dir}")
+            if not zipfile.is_zipfile(file_path):
+                logger.error(f"{file_path} is not a valid ZIP")
+                return False
+            with zipfile.ZipFile(file_path, 'r') as z:
+                z.extractall(extract_dir)
+        else:
+            logger.debug(f"Skipping non-archive {file_path}")
+            return False
     except Exception as e:
         logger.error(f"Extraction failed for {file_path}: {e}")
         return False
+    try:
+        os.remove(file_path)
+        logger.debug(f"Removed archive {file_path} after extraction")
+    except OSError as e:
+        logger.warning(f"Could not remove archive {file_path}: {e}")
+    for root, _, files in os.walk(extract_dir):
+        for fname in files:
+            if fname.lower().endswith(('.zip')):
+                nested = os.path.join(root, fname)
+                if nested != file_path:
+                    extract_archive(nested, root)
+    return True
 
 
 def save_downloaded_list(dl):
@@ -167,7 +185,7 @@ def process_attachments(session, post_data, pid, dl):
         name = att.get('name')
         logger.debug(f"Found attachment: name={name}, extension={ext}, path={path}")
         if ext != '.zip':
-            logger.debug("Skipping non-zip attachment")
+            logger.debug("Skipping non-archive attachment")
             continue
         if not path or not name or path in dl:
             logger.debug("Already downloaded or invalid attachment, skipping")
@@ -175,18 +193,23 @@ def process_attachments(session, post_data, pid, dl):
         url = f"{att.get('server')}/data{path}"
         local_path = os.path.join(DOWNLOAD_DIR, name)
         if download_file(session, url, local_path):
-            if extract_zip(local_path, REPOSITORY_DIR):
-                try:
-                    os.remove(local_path)
-                    logger.debug(f"Removed local zip {local_path}")
-                except OSError as e:
-                    logger.warning(f"Could not remove {local_path}: {e}")
+            if extract_archive(local_path, REPOSITORY_DIR):
                 dl.add(path)
                 save_downloaded_list(dl)
             else:
                 logger.error(f"Extraction failed for {local_path}")
         else:
             logger.error(f"Download failed for {url}")
+
+
+def process_existing_archives():
+    logger = logging.getLogger('process_existing_archives')
+    logger.info(f"Scanning {REPOSITORY_DIR} for existing archives")
+    for root, _, files in os.walk(REPOSITORY_DIR):
+        for fname in files:
+            if fname.lower().endswith(('.zip')):
+                path = os.path.join(root, fname)
+                extract_archive(path, root)
 
 
 def main():
@@ -198,6 +221,8 @@ def main():
     downloaded_list = load_downloaded_list()
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(REPOSITORY_DIR, exist_ok=True)
+
+    process_existing_archives()
 
     for pid in POST_IDS:
         logger.info(f"Handling post ID: {pid}")
