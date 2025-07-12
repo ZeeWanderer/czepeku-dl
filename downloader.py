@@ -8,6 +8,7 @@ from tqdm import tqdm
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 import http.client
+from requests.exceptions import ChunkedEncodingError
 
 SERVICE = "patreon"
 USER_ID = "16010661"
@@ -18,9 +19,22 @@ DOWNLOAD_DIR = "downloads"
 REPOSITORY_DIR = "maps_repository"
 
 
+def setup_logging():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("patreon_downloader.log", mode='a'),
+            logging.StreamHandler()
+        ]
+    )
+
+
 def load_cookies():
+    logger = logging.getLogger('load_cookies')
+    logger.debug(f"Looking for cookie file at {COOKIE_FILE}")
     if not os.path.exists(COOKIE_FILE):
-        logging.error(f"Cookie file {COOKIE_FILE} not found")
+        logger.error(f"Cookie file {COOKIE_FILE} not found")
         exit(1)
     cookie_jar = MozillaCookieJar(COOKIE_FILE)
     cookie_jar.load()
@@ -30,125 +44,171 @@ def load_cookies():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.cookies = cookie_jar
-    logging.info("Cookies loaded")
+    logger.info("Cookies loaded into session")
     return session
 
 
 def load_downloaded_list():
-    try:
-        if os.path.exists(DOWNLOADED_LIST_FILE):
+    logger = logging.getLogger('load_downloaded_list')
+    if os.path.exists(DOWNLOADED_LIST_FILE):
+        try:
             with open(DOWNLOADED_LIST_FILE, 'rb') as f:
-                return pickle.load(f)
-        return set()
-    except pickle.PickleError:
-        logging.error("Error loading downloaded list, starting fresh")
-        return set()
+                dl = pickle.load(f)
+            logger.info(f"Loaded downloaded list with {len(dl)} entries")
+            return dl
+        except Exception as e:
+            logger.error(f"Error loading downloaded list: {e}")
+    else:
+        logger.debug("No existing downloaded list found, starting fresh")
+    return set()
 
 
 def fetch_post_data(session, post_id):
+    logger = logging.getLogger('fetch_post_data')
     url = f"https://kemono.su/api/v1/{SERVICE}/user/{USER_ID}/post/{post_id}"
+    logger.debug(f"Fetching post data from {url}")
     try:
-        response = session.get(url)
-        response.raise_for_status()
-        return response.json()
+        r = session.get(url)
+        r.raise_for_status()
+        logger.info(f"Successfully fetched data for post {post_id}")
+        return r.json()
     except requests.RequestException as e:
-        logging.error(f"Failed to fetch post {post_id}: {e}")
-        if 'response' in locals():
-            logging.error(f"Response status: {response.status_code}")
-            logging.error(f"Response content: {response.text}")
+        logger.error(f"Failed to fetch post {post_id}: {e}")
         return None
 
 
 def download_file(session, url, path):
+    logger = logging.getLogger('download_file')
+    logger.info(f"Starting download: {url}")
     temp_path = path + '.part'
-    headers = {}
-    if os.path.exists(temp_path):
-        resume_byte_pos = os.path.getsize(temp_path)
-        headers['Range'] = f'bytes={resume_byte_pos}-'
-    try:
-        response = session.get(url, stream=True, headers=headers)
-        response.raise_for_status()
-        mode = 'ab' if response.status_code == 206 else 'wb'
-        total_size = int(response.headers.get('content-length', 0))
-        with open(temp_path, mode) as f, tqdm(total=total_size, unit='B', unit_scale=True, desc=os.path.basename(path)) as pbar:
-            for chunk in response.iter_content(8192):
-                try:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    downloaded = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+    if downloaded:
+        logger.debug(f"Resuming download for {path} at byte {downloaded}")
+    headers = {'Range': f'bytes={downloaded}-'} if downloaded else {}
+    total_size = None
+
+    while True:
+        try:
+            r = session.get(url, stream=True, headers=headers, timeout=30)
+            if total_size is None:
+                if 'content-range' in r.headers:
+                    total_size = int(r.headers['content-range'].split('/')[-1])
+                else:
+                    total_size = int(r.headers.get('content-length', 0))
+                logger.debug(f"Total size for {url}: {total_size} bytes")
+
+            if r.status_code not in (200, 206):
+                logger.error(f"Unexpected status {r.status_code} for {url}")
+                return False
+
+            with open(temp_path, 'ab') as f, tqdm(total=total_size, initial=downloaded, unit='B', unit_scale=True, desc=os.path.basename(path)) as pbar:
+                for chunk in r.iter_content(8192):
+                    if not chunk:
+                        continue
                     f.write(chunk)
-                except http.client.IncompleteRead as e:
-                    f.write(e.partial)
-                pbar.update(len(chunk))
-        os.rename(temp_path, path)
-        return True
-    except requests.RequestException as e:
-        logging.error(f"Download failed for {os.path.basename(path)}: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        return False
+                    downloaded += len(chunk)
+                    pbar.update(len(chunk))
+
+            if downloaded >= total_size:
+                logger.info(f"Download completed for {path}")
+                break
+            headers['Range'] = f'bytes={downloaded}-'
+
+        except (http.client.IncompleteRead, ChunkedEncodingError) as e:
+            logger.warning(f"Incomplete read error: {e}, retrying from {downloaded}")
+            partial = getattr(e, 'partial', None)
+            if partial:
+                with open(temp_path, 'ab') as f:
+                    f.write(partial)
+                    downloaded += len(partial)
+            headers['Range'] = f'bytes={downloaded}-'
+            continue
+        except requests.RequestException as e:
+            logger.error(f"Download error for {url}: {e}")
+            return False
+
+    os.rename(temp_path, path)
+    return True
 
 
 def extract_zip(file_path, extract_dir):
+    logger = logging.getLogger('extract_zip')
+    logger.info(f"Extracting {file_path} to {extract_dir}")
     if not zipfile.is_zipfile(file_path):
-        logging.error(f"{file_path} is not a zip file")
+        logger.error(f"{file_path} is not a zip file")
         return False
     try:
-        with zipfile.ZipFile(file_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
+        with zipfile.ZipFile(file_path, 'r') as z:
+            z.extractall(extract_dir)
+        logger.info(f"Extraction successful for {file_path}")
         return True
-    except zipfile.BadZipFile:
-        logging.error(f"{file_path} is a bad zip file")
-        return False
     except Exception as e:
-        logging.error(f"Extraction failed for {file_path}: {e}")
+        logger.error(f"Extraction failed for {file_path}: {e}")
         return False
 
 
-def save_downloaded_list(downloaded_list):
-    with open(DOWNLOADED_LIST_FILE, 'wb') as f:
-        pickle.dump(downloaded_list, f)
+def save_downloaded_list(dl):
+    logger = logging.getLogger('save_downloaded_list')
+    try:
+        with open(DOWNLOADED_LIST_FILE, 'wb') as f:
+            pickle.dump(dl, f)
+        logger.debug(f"Saved downloaded list with {len(dl)} entries")
+    except Exception as e:
+        logger.error(f"Failed to save downloaded list: {e}")
 
 
-def process_attachments(session, post_data, post_id, downloaded_list):
-    if 'attachments' not in post_data:
-        logging.warning(f"No attachments found in post {post_id}")
-        return
-    for attachment in post_data['attachments']:
-        if attachment.get('name_extension') != '.zip':
-            logging.info(f"Skipping non-zip attachment: {attachment.get('name')}")
+def process_attachments(session, post_data, pid, dl):
+    logger = logging.getLogger('process_attachments')
+    logger.debug(f"Processing attachments for post {pid}")
+    for att in post_data.get('attachments', []):
+        ext = att.get('name_extension')
+        path = att.get('path')
+        name = att.get('name')
+        logger.debug(f"Found attachment: name={name}, extension={ext}, path={path}")
+        if ext != '.zip':
+            logger.debug("Skipping non-zip attachment")
             continue
-        file_path = attachment.get('path')
-        file_name = attachment.get('name')
-        if not file_path or not file_name:
-            logging.warning(f"Invalid attachment in post {post_id}")
+        if not path or not name or path in dl:
+            logger.debug("Already downloaded or invalid attachment, skipping")
             continue
-        if file_path in downloaded_list:
-            logging.info(f"{file_name} already downloaded")
-            continue
-        download_url = f"{attachment.get('server')}/data{file_path}"
-        local_path = os.path.join(DOWNLOAD_DIR, file_name)
-        if download_file(session, download_url, local_path):
+        url = f"{att.get('server')}/data{path}"
+        local_path = os.path.join(DOWNLOAD_DIR, name)
+        if download_file(session, url, local_path):
             if extract_zip(local_path, REPOSITORY_DIR):
                 try:
                     os.remove(local_path)
-                    logging.info(f"Deleted zip file {file_name} after extraction")
+                    logger.debug(f"Removed local zip {local_path}")
                 except OSError as e:
-                    logging.error(f"Failed to delete zip file {file_name}: {e}")
-                downloaded_list.add(file_path)
-                save_downloaded_list(downloaded_list)
-                logging.info(f"Processed {file_name} from post {post_id}")
+                    logger.warning(f"Could not remove {local_path}: {e}")
+                dl.add(path)
+                save_downloaded_list(dl)
             else:
-                logging.error(f"Failed to extract {file_name}")
+                logger.error(f"Extraction failed for {local_path}")
         else:
-            logging.error(f"Failed to download {file_name}")
+            logger.error(f"Download failed for {url}")
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    logging.info("Script started")
+
+def main():
+    setup_logging()
+    logger = logging.getLogger('main')
+    logger.info("Starting Patreon downloader script")
+
     session = load_cookies()
     downloaded_list = load_downloaded_list()
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(REPOSITORY_DIR, exist_ok=True)
-    for post_id in POST_IDS:
-        post_data = fetch_post_data(session, post_id)
-        if post_data:
-            process_attachments(session, post_data, post_id, downloaded_list)
-    logging.info("Script completed")
+
+    for pid in POST_IDS:
+        logger.info(f"Handling post ID: {pid}")
+        data = fetch_post_data(session, pid)
+        if data:
+            process_attachments(session, data, pid, downloaded_list)
+        else:
+            logger.error(f"No data for post {pid}, skipping")
+
+    logger.info("All posts processed, exiting")
+
+
+if __name__ == "__main__":
+    main()
