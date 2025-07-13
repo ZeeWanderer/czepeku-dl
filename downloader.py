@@ -249,28 +249,16 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
     logger = logging.getLogger(f"{__name__}.download_file")
     if shutdown_event.is_set():
         return False
-        
-    temp_path = path + '.part'
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except OSError as e:
-        logger.error(f"Failed to create directory for {path}: {e}")
-        return False
     
-    downloaded = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
-    
-    headers = {'Range': f'bytes={downloaded}-'} if downloaded else {}
     total_size = None
     retry_count = 0
-    initial_downloaded = downloaded
     filename = os.path.basename(path)
 
-    progress_bar = None
+    progress_bar: tqdm = None
     with progress_lock:
         try:
             progress_bar = tqdm(
                 total=total_size,
-                initial=downloaded,
                 unit='B',
                 unit_scale=True,
                 desc=filename,
@@ -284,6 +272,22 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
             logger.error(f"Failed to create progress bar for {filename}: {e}")
             return False
 
+    temp_path = path + '.part'
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as e:
+        logger.error(f"Failed to create directory for {path}: {e}")
+        return False
+    
+    downloaded = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+    headers = {'Range': f'bytes={downloaded}-'} if downloaded else {}
+    
+    initial_downloaded = downloaded
+
+    with progress_lock:
+        progress_bar.n = initial_downloaded
+        progress_bar.refresh()
+
     while not shutdown_event.is_set() and retry_count < max_retries:
         logger.info(f"Starting download attempt {retry_count + 1}/{max_retries} for {filename}")
         logger.debug(f"Download headers: {headers}")
@@ -291,11 +295,14 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
             with session.get(url, stream=True, headers=headers, timeout=(10, 5)) as r:
                 r.raise_for_status()
                 
-                if total_size is None:
-                    if 'content-range' in r.headers:
-                        total_size = int(r.headers['content-range'].split('/')[-1])
-                    else:
-                        total_size = int(r.headers.get('content-length', 0)) + downloaded
+                total_size_in_header = None
+                if 'content-range' in r.headers:
+                    total_size_in_header = int(r.headers['content-range'].split('/')[-1])
+                else:
+                    total_size_in_header = int(r.headers.get('content-length', 0)) + downloaded
+
+                if total_size_in_header is not None and total_size_in_header != total_size:
+                    total_size = total_size_in_header
                     with progress_lock:
                         logger.debug(f"Setting total_size to {total_size} for {filename}")
                         progress_bar.total = total_size
