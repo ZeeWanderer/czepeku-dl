@@ -1,17 +1,23 @@
 {
-  // https://www.patreon.com/c/czepeku/home
-  "16010661": [
-    "27816327", // Main maps
-    "49184370"  // Animated
-  ],
-  // https://www.patreon.com/c/czepekuscifi/home
-  "74462793": [
-    "67639434", // Main
-    "70330505" // Animated
-  ]/*,
-  // https://www.patreon.com/c/czepekuscenes/home
-  "85204685": [
-    "79200795", // Main
-    "79200864" // Animated
-  ] */
+  "czepeku": {
+    "user_id": "16010661",
+    "posts": {
+      "main": "27816327",
+      "animated": "49184370"
+    }
+  },
+  "czepekuscifi": {
+    "user_id": "74462793",
+    "posts": {
+      "main": "67639434",
+      "animated": "70330505"
+    }
+  },
+  "czepekuscenes": {
+    "user_id": "85204685",
+    "posts": {
+      "main": "79200795",
+      "animated": "79200864"
+    }
+  }
 }

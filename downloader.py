@@ -664,6 +664,10 @@ def parse_arguments():
                         help="Maximum backoff delay in seconds between retries")
     parser.add_argument('--progress-only', action='store_true',
                         help="Show logs on console in addition to file (default: False)")
+    parser.add_argument('--creators', type=str, nargs='+',
+                        help="Creators to process (e.g., czepeku czepekuscifi)")
+    parser.add_argument('--sets', type=str, nargs='+',
+                        help="Sets to process (main animated)")
     try:
         args = parser.parse_args()
         logger.debug(f"Parsed arguments: {vars(args)}")
@@ -715,7 +719,21 @@ def main():
     
     jar = load_cookies(COOKIE_FILE)
     
-    users_posts = load_users_posts()
+    users_posts_raw = load_users_posts()
+    
+    if args.creators:
+        users_posts_raw = {k: v for k, v in users_posts_raw.items() if k in args.creators}
+    
+    users_posts = {}
+    for creator, info in users_posts_raw.items():
+        user_id = info['user_id']
+        post_dict = info['posts']
+        selected_posts = list(post_dict.values())
+        if args.sets:
+            selected_posts = [post_dict[s] for s in args.sets if s in post_dict]
+        if selected_posts:
+            users_posts[user_id] = selected_posts
+    
     user_count = len(users_posts)
     post_count = sum(len(posts) for posts in users_posts.values())
     logger.info(f"Loaded {user_count} users with {post_count} posts")
