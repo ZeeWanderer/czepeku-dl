@@ -193,56 +193,86 @@ def download_file(session, url, path):
 
 def extract_archive(file_path, extract_dir):
     """
-    Extracts ZIP archives to the target directory, removes the archive, and cleans up __MACOSX folders.
-    Recursively processes nested ZIP files.
+    Extracts a ZIP archive to the given directory.
+    If the archive contains exactly one top-level folder (excluding any '__MACOSX' entries
+    and ignoring '.DS_Store' files), contents are extracted directly into extract_dir. Otherwise,
+    a new folder named after the archive (without extension) is created under extract_dir and
+    contents are extracted into it. After extraction, the original archive is removed, nested
+    archives are recursively extracted, and any '__MACOSX' directories or '.DS_Store' files
+    are cleaned up.
 
     Args:
-        file_path (str): Path to the ZIP archive.
+        file_path (str): Path to the ZIP file to extract.
         extract_dir (str): Directory to extract contents into.
 
     Returns:
-        bool: True if extraction succeeded, False otherwise.
+        bool: True on success, False on failure.
     """
     logger = logging.getLogger('extract_archive')
-    base, ext = os.path.splitext(file_path.lower())
     try:
-        if ext == '.zip':
-            logger.info(f"Extracting ZIP {file_path} to {extract_dir}")
-            if not zipfile.is_zipfile(file_path):
-                logger.error(f"{file_path} is not a valid ZIP")
-                return False
-            with zipfile.ZipFile(file_path, 'r') as z:
-                z.extractall(extract_dir)
-        else:
-            logger.debug(f"Skipping non-archive {file_path}")
+        if not zipfile.is_zipfile(file_path):
+            logger.error(f"{file_path} is not a valid ZIP archive")
             return False
+
+        with zipfile.ZipFile(file_path, 'r') as zf:
+            names = zf.namelist()
+            top_levels = set(
+                entry.split('/')[0]
+                for entry in names
+                if entry
+                and not entry.split('/')[0].startswith('__MACOSX')
+                and entry.split('/')[0] != '.DS_Store'
+            )
+
+            if len(top_levels) == 1 and any(
+                entry.endswith('/') and entry.split('/')[0] == next(iter(top_levels))
+                for entry in names
+            ):
+                target = extract_dir
+                logger.info(
+                    f"Archive contains a single folder '{next(iter(top_levels))}/', extracting into {extract_dir}"
+                )
+            else:
+                base_name = os.path.splitext(os.path.basename(file_path))[0]
+                target = os.path.join(extract_dir, base_name)
+                os.makedirs(target, exist_ok=True)
+                logger.info(
+                    f"No single top-level folder (excluding '__MACOSX' and '.DS_Store') found; extracting into new directory {target}"
+                )
+
+            zf.extractall(target)
+
+        try:
+            os.remove(file_path)
+            logger.debug(f"Removed archive {file_path} after extraction")
+        except OSError as e:
+            logger.warning(f"Could not remove archive {file_path}: {e}")
+
+        for root, dirs, files in os.walk(target):
+            if '__MACOSX' in dirs:
+                macosx_path = os.path.join(root, '__MACOSX')
+                shutil.rmtree(macosx_path, ignore_errors=True)
+                logger.debug(f"Removed '__MACOSX' directory {macosx_path}")
+            for fname in list(files):
+                if fname == '.DS_Store':
+                    ds_path = os.path.join(root, fname)
+                    try:
+                        os.remove(ds_path)
+                        logger.debug(f"Removed '.DS_Store' file {ds_path}")
+                    except OSError as e:
+                        logger.warning(f"Could not remove '.DS_Store' file {ds_path}: {e}")
+
+        for root, _, files in os.walk(target):
+            for fname in files:
+                if fname.lower().endswith('.zip'):
+                    nested = os.path.join(root, fname)
+                    if nested != file_path:
+                        extract_archive(nested, root)
+        return True
     except Exception as e:
         logger.error(f"Extraction failed for {file_path}: {e}")
         return False
 
-    try:
-        os.remove(file_path)
-        logger.debug(f"Removed archive {file_path} after extraction")
-    except OSError as e:
-        logger.warning(f"Could not remove archive {file_path}: {e}")
-
-    for root, dirs, _ in os.walk(extract_dir):
-        for d in dirs:
-            if d == '__MACOSX':
-                macosx_path = os.path.join(root, d)
-                try:
-                    shutil.rmtree(macosx_path)
-                    logger.debug(f"Removed __MACOSX directory {macosx_path}")
-                except Exception as e:
-                    logger.warning(f"Could not remove __MACOSX directory {macosx_path}: {e}")
-
-    for root, _, files in os.walk(extract_dir):
-        for fname in files:
-            if fname.lower().endswith('.zip'):
-                nested = os.path.join(root, fname)
-                if nested != file_path:
-                    extract_archive(nested, root)
-    return True
 
 
 def save_downloaded_list(dl):
