@@ -1,6 +1,7 @@
 import requests
 import os
 import zipfile
+import json
 from http.cookiejar import MozillaCookieJar
 import logging
 import pickle
@@ -10,10 +11,10 @@ from requests.adapters import HTTPAdapter
 import http.client
 from requests.exceptions import ChunkedEncodingError
 import shutil
+import re
 
 SERVICE = "patreon"
-USER_ID = "16010661"
-POST_IDS = ["27816327"]
+USERS_POSTS_FILE = "users_posts.json"  # JSON file mapping user IDs to post ID lists
 COOKIE_FILE = "cookies.txt"
 DOWNLOADED_LIST_FILE = "downloaded_files.pkl"
 DOWNLOAD_DIR = "downloads"
@@ -34,6 +35,27 @@ def setup_logging():
     )
 
 
+def load_users_posts():
+    """
+    Loads a JSONC (JSON with comments) file by stripping // and /* */ comments before parsing.
+    """
+    logger = logging.getLogger('load_users_posts')
+    if not os.path.exists(USERS_POSTS_FILE):
+        logger.error(f"Users-posts config {USERS_POSTS_FILE} not found")
+        exit(1)
+    try:
+        with open(USERS_POSTS_FILE, 'r') as f:
+            content = f.read()
+        content = re.sub(r'//.*', '', content)
+        content = re.sub(r'/\*[\s\S]*?\*/', '', content)
+        data = json.loads(content)
+        logger.info(f"Loaded users-posts mapping for {len(data)} users")
+        return data
+    except Exception as e:
+        logger.error(f"Failed to load {USERS_POSTS_FILE}: {e}")
+        exit(1)
+
+
 def load_cookies():
     """
     Loads cookies from COOKIE_FILE into a requests.Session with retry logic.
@@ -49,7 +71,7 @@ def load_cookies():
     cookie_jar = MozillaCookieJar(COOKIE_FILE)
     cookie_jar.load()
     session = requests.Session()
-    retry = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET"])
+    retry = Retry(total=15, backoff_factor=1, backoff_jitter=1, backoff_max=10, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET"])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
@@ -79,7 +101,7 @@ def load_downloaded_list():
     return set()
 
 
-def fetch_post_data(session, post_id):
+def fetch_post_data(session, user_id, post_id):
     """
     Fetches JSON data for a specific post from the kemono API.
 
@@ -91,15 +113,15 @@ def fetch_post_data(session, post_id):
         dict or None: Parsed JSON response if successful, otherwise None.
     """
     logger = logging.getLogger('fetch_post_data')
-    url = f"https://kemono.su/api/v1/{SERVICE}/user/{USER_ID}/post/{post_id}"
+    url = f"https://kemono.su/api/v1/{SERVICE}/user/{user_id}/post/{post_id}"
     logger.debug(f"Fetching post data from {url}")
     try:
         r = session.get(url)
         r.raise_for_status()
-        logger.info(f"Successfully fetched data for post {post_id}")
+        logger.info(f"Successfully fetched data for user {user_id}, post {post_id}")
         return r.json()
     except requests.RequestException as e:
-        logger.error(f"Failed to fetch post {post_id}: {e}")
+        logger.error(f"Failed to fetch post {post_id} for user {user_id}: {e}")
         return None
 
 
@@ -239,7 +261,7 @@ def save_downloaded_list(dl):
         logger.error(f"Failed to save downloaded list: {e}")
 
 
-def process_attachments(session, post_data, pid, dl):
+def process_attachments(session, post_data, user_id, pid, dl):
     """
     Downloads and extracts new .zip attachments from post data, skipping already downloaded items.
 
@@ -250,7 +272,7 @@ def process_attachments(session, post_data, pid, dl):
         dl (set): Set of already downloaded file paths or identifiers.
     """
     logger = logging.getLogger('process_attachments')
-    logger.debug(f"Processing attachments for post {pid}")
+    logger.debug(f"Processing attachments for user {user_id}, post {pid}")
     for att in post_data.get('attachments', []):
         ext = att.get('name_extension')
         path = att.get('path')
@@ -296,6 +318,7 @@ def main():
     logger = logging.getLogger('main')
     logger.info("Starting Patreon downloader script")
 
+    users_posts = load_users_posts()
     session = load_cookies()
     downloaded_list = load_downloaded_list()
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -303,16 +326,16 @@ def main():
 
     process_existing_archives()
 
-    for pid in POST_IDS:
-        logger.info(f"Handling post ID: {pid}")
-        data = fetch_post_data(session, pid)
-        if data:
-            process_attachments(session, data, pid, downloaded_list)
-        else:
-            logger.error(f"No data for post {pid}, skipping")
+    for user_id, post_ids in users_posts.items():
+        for pid in post_ids:
+            logger.info(f"Handling user {user_id}, post ID: {pid}")
+            data = fetch_post_data(session, user_id, pid)
+            if data:
+                process_attachments(session, data, user_id, pid, downloaded_list)
+            else:
+                logger.error(f"No data for user {user_id}, post {pid}, skipping")
 
-    logger.info("All posts processed, exiting")
-
+    logger.info("All users and posts processed, exiting")
 
 if __name__ == "__main__":
     main()
