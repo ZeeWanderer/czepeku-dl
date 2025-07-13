@@ -276,6 +276,8 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
     except OSError as e:
+        with progress_lock:
+            progress_bar.close()
         logger.error(f"Failed to create directory for {path}: {e}")
         return False
     
