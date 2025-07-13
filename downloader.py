@@ -4,15 +4,17 @@ import zipfile
 import json
 from http.cookiejar import MozillaCookieJar
 import logging
+from logging.handlers import RotatingFileHandler
 import pickle
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 import http.client
-from requests.exceptions import ChunkedEncodingError
+from requests.exceptions import ChunkedEncodingError, ReadTimeout
 import shutil
 import re
 from colorlog import ColoredFormatter
+import argparse
 
 SERVICE = "patreon"
 USERS_POSTS_FILE = "users_posts.json" 
@@ -20,12 +22,16 @@ COOKIE_FILE = "cookies.txt"
 DOWNLOADED_LIST_FILE = "downloaded_files.pkl"
 DOWNLOAD_DIR = "downloads"
 REPOSITORY_DIR = "maps_repository"
+LOG_DIR = "logs"
+LOG_FILE = "czepeku-dl.log"
 
 
-def setup_logging():
+def setup_logging(log_level):
     """
     Configures the root logger to output colored debug and higher level logs to both a file and the console.
     """
+    os.makedirs(LOG_DIR, exist_ok=True)
+
     console_formatter = ColoredFormatter(
         "%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         datefmt=None,
@@ -39,24 +45,35 @@ def setup_logging():
         }
     )
 
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(console_formatter)
+
     file_formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
-    console_handler.setFormatter(console_formatter)
+    log_path = os.path.join(LOG_DIR, LOG_FILE)
+    rotating_handler = RotatingFileHandler(
+        filename=log_path,
+        mode='a',
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding=None,
+        delay=0
+    )
+    rotating_handler.setLevel(log_level)
+    rotating_handler.setFormatter(file_formatter)
 
-    file_handler = logging.FileHandler("patreon_downloader.log", mode='a')
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(file_formatter)
+    if os.path.exists(log_path) and os.path.getsize(log_path) > 0:
+        rotating_handler.doRollover()
 
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+    root.setLevel(log_level)
     for h in root.handlers[:]:
         root.removeHandler(h)
     root.addHandler(console_handler)
-    root.addHandler(file_handler)
+    root.addHandler(rotating_handler)
 
 
 def load_users_posts():
@@ -90,7 +107,7 @@ def load_cookies():
     logger = logging.getLogger('load_cookies')
     logger.debug(f"Looking for cookie file at {COOKIE_FILE}")
     if not os.path.exists(COOKIE_FILE):
-        logger.error(f"Cookie file {COOKIE_FILE} not found")
+        logger.critical(f"Cookie file {COOKIE_FILE} not found")
         exit(1)
     cookie_jar = MozillaCookieJar(COOKIE_FILE)
     cookie_jar.load()
@@ -119,7 +136,7 @@ def load_downloaded_list():
             logger.info(f"Loaded downloaded list with {len(dl)} entries")
             return dl
         except Exception as e:
-            logger.error(f"Error loading downloaded list: {e}")
+            logger.critical(f"Error loading downloaded list: {e}")
     else:
         logger.debug("No existing downloaded list found, starting fresh")
     return set()
@@ -198,8 +215,8 @@ def download_file(session, url, path):
                 break
             headers['Range'] = f'bytes={downloaded}-'
 
-        except (http.client.IncompleteRead, ChunkedEncodingError) as e:
-            logger.warning(f"Incomplete read error: {e}, retrying from {downloaded}")
+        except (http.client.IncompleteRead, ChunkedEncodingError, ReadTimeout) as e:
+            logger.warning(f"Transient download error: {e}, retrying at byte {downloaded}")
             partial = getattr(e, 'partial', None)
             if partial:
                 with open(temp_path, 'ab') as f:
@@ -363,12 +380,30 @@ def process_existing_archives():
                 extract_archive(path, root)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Patreon downloader script with configurable logging and paths.")
+    parser.add_argument('-l', '--log-level', default=os.getenv('LOG_LEVEL', 'INFO'),
+                        help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
+    parser.add_argument('-u', '--users-posts', default=USERS_POSTS_FILE,
+                        help="Path to users_posts JSON file")
+    parser.add_argument('-c', '--cookies', default=COOKIE_FILE,
+                        help="Path to cookies.txt file")
+    parser.add_argument('-d', '--download-dir', default=DOWNLOAD_DIR,
+                        help="Directory to save downloads")
+    parser.add_argument('-r', '--repo-dir', default=REPOSITORY_DIR,
+                        help="Directory for extracted archives")
+    return parser.parse_args()
+
+
 def main():
     """
     Main entry point for the Patreon downloader. Initializes logging, loads cookies and state,
     ensures directories exist, processes existing archives, and iterates through specified posts.
     """
-    setup_logging()
+    args = parse_args()
+    numeric_level = logging._nameToLevel.get(args.log_level.upper(), logging.INFO)
+    setup_logging(numeric_level)
+
     logger = logging.getLogger('main')
     logger.info("Starting Patreon downloader script")
 
