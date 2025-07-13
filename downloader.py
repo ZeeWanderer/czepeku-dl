@@ -37,7 +37,7 @@ LOG_DIR = "logs"
 LOG_FILE = "czepeku-dl.log"
 
 listener = None
-_download_lock = Lock()
+_download_lock = RLock()
 progress_lock = RLock()
 shutdown_event = Event()
 thread_local = threading.local()
@@ -206,7 +206,7 @@ def append_to_downloaded_list(attachment_path, zip_name, extract_path):
     file_exists = os.path.exists(DOWNLOADED_LIST_FILE)
     try:
         with open(DOWNLOADED_LIST_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
+            writer = csv.writer(f, quoting=csv.QUOTE_ALL)
             if not file_exists:
                 writer.writerow(['attachment_path', 'zip_name', 'extract_path'])
             writer.writerow([attachment_path, zip_name, extract_path])
@@ -576,8 +576,9 @@ def process_attachment(attachment, downloaded_dict, max_retries, backoff_factor,
         
         extract_path = extract_archive(local_path, REPOSITORY_DIR)
         if extract_path:
-            downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
-            append_to_downloaded_list(attachment_path, filename, extract_path)
+            with _download_lock:
+                downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
+                append_to_downloaded_list(attachment_path, filename, extract_path)
             logger.info(f"Successfully processed {filename}")
             position_queue.put(position)
             return True
