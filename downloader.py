@@ -263,7 +263,6 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
             unit='B',
             unit_scale=True,
             desc=filename,
-            disable=logger.level > logging.INFO,
             leave=False,
             mininterval=0.5,
             position=position,
@@ -594,7 +593,7 @@ def collect_attachments(executor, users_posts, max_retries, backoff_factor, max_
     not_done = set(fetch_futures)
     
     try:
-        with tqdm(total=post_count, desc="Fetching posts", leave=True, position=0, disable=logger.level > logging.INFO) as post_bar:
+        with tqdm(total=post_count, desc="Fetching posts", leave=True, position=0) as post_bar:
             while not_done and not shutdown_event.is_set():
                 done, not_done = wait(not_done, timeout=0.5, return_when=FIRST_COMPLETED)
                 for future in done:
@@ -762,7 +761,7 @@ def main():
         
         not_done = set(futures)
         try:
-            with tqdm(total=total_attachments, desc="Overall progress", leave=True, position=0, disable=logger.level > logging.INFO) as overall_progress:
+            with tqdm(total=total_attachments, desc="Overall progress", leave=True, position=0) as overall_progress:
                 while not_done and not shutdown_event.is_set():
                     logger.debug(f"Waiting for {len(not_done)} remaining tasks")
                     done, not_done = wait(not_done, timeout=0.5, return_when=FIRST_COMPLETED)
