@@ -184,6 +184,7 @@ def load_cookies(cookie_file):
 def init_downloaded_db(db_file):
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
+    c.execute('PRAGMA journal_mode=WAL')
     c.execute('''CREATE TABLE IF NOT EXISTS downloaded 
                  (attachment_path TEXT PRIMARY KEY, zip_name TEXT, extract_path TEXT)''')
     conn.commit()
@@ -194,25 +195,23 @@ def load_downloaded_list(db_file):
     logger.info("Loading previously downloaded files list")
     init_downloaded_db(db_file)
     downloaded_dict = {}
-    with _download_lock:
-        conn = sqlite3.connect(db_file)
-        c = conn.cursor()
-        c.execute('SELECT attachment_path, zip_name, extract_path FROM downloaded')
-        for row in c:
-            downloaded_dict[row[0]] = {'zip_name': row[1], 'extract_path': row[2]}
-        conn.close()
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+    c.execute('SELECT attachment_path, zip_name, extract_path FROM downloaded')
+    for row in c:
+        downloaded_dict[row[0]] = {'zip_name': row[1], 'extract_path': row[2]}
+    conn.close()
     logger.debug(f"Loaded downloaded dict with {len(downloaded_dict)} entries")
     return downloaded_dict
 
 def append_to_downloaded_list(db_file, attachment_path, zip_name, extract_path):
     logger = logging.getLogger(f"{__name__}.append_to_downloaded_list")
-    with _download_lock:
-        conn = sqlite3.connect(db_file)
-        c = conn.cursor()
-        c.execute('INSERT OR REPLACE INTO downloaded (attachment_path, zip_name, extract_path) VALUES (?, ?, ?)',
-                  (attachment_path, zip_name, extract_path))
-        conn.commit()
-        conn.close()
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO downloaded (attachment_path, zip_name, extract_path) VALUES (?, ?, ?)',
+              (attachment_path, zip_name, extract_path))
+    conn.commit()
+    conn.close()
     logger.debug(f"Appended {attachment_path} to downloaded list")
 
 def fetch_post_data(user_id, post_id, max_retries, backoff_factor, max_backoff):
@@ -266,21 +265,24 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
     initial_downloaded = downloaded
     filename = os.path.basename(path)
 
-    try:
-        progress_bar = tqdm(
-            total=total_size,
-            initial=downloaded,
-            unit='B',
-            unit_scale=True,
-            desc=filename,
-            leave=False,
-            mininterval=0.5,
-            position=position,
-            dynamic_ncols=True
-        )
-    except Exception as e:
-        logger.error(f"Failed to create progress bar for {filename}: {e}")
-        return False
+    progress_bar = None
+    with progress_lock:
+        try:
+            progress_bar = tqdm(
+                total=total_size,
+                initial=downloaded,
+                unit='B',
+                unit_scale=True,
+                desc=filename,
+                leave=False,
+                mininterval=0.5,
+                position=position,
+                dynamic_ncols=True
+            )
+            progress_bar.refresh()
+        except Exception as e:
+            logger.error(f"Failed to create progress bar for {filename}: {e}")
+            return False
 
     while not shutdown_event.is_set() and retry_count < max_retries:
         logger.info(f"Starting download attempt {retry_count + 1}/{max_retries} for {filename}")
@@ -589,7 +591,7 @@ def process_attachment(attachment, downloaded_dict, db_file, max_retries, backof
         if extract_path:
             with _download_lock:
                 downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
-                append_to_downloaded_list(db_file, attachment_path, filename, extract_path)
+            append_to_downloaded_list(db_file, attachment_path, filename, extract_path)
             logger.info(f"Successfully processed {filename}")
             position_queue.put(position)
             return True
