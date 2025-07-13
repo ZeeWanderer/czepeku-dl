@@ -417,7 +417,7 @@ def safe_remove(path):
             return False
     return False
 
-def extract_archive(file_path, extract_dir):
+def extract_archive(file_path, extract_dir, position):
     logger = logging.getLogger(f"{__name__}.extract_archive")
     logger.info(f"Starting extraction of {os.path.basename(file_path)} to {extract_dir}")
     if shutdown_event.is_set():
@@ -473,8 +473,31 @@ def extract_archive(file_path, extract_dir):
                 logger.error(f"Failed to create target directory {target}: {e}")
                 return None
 
+            extractable = []
+            for member in infolist:
+                if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
+                    continue
+                if not member.is_dir():
+                    extractable.append(member)
+            total_files = len(extractable)
+
+            progress_bar = None
+            with progress_lock:
+                progress_bar = tqdm(
+                    total=total_files,
+                    unit=' files',
+                    desc=f"Extracting {filename}",
+                    leave=False,
+                    mininterval=0.5,
+                    position=position,
+                    dynamic_ncols=True
+                )
+                progress_bar.refresh()
+
             for member in infolist:
                 if shutdown_event.is_set():
+                    with progress_lock:
+                        progress_bar.close()
                     return None
                 if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
                     continue
@@ -500,9 +523,14 @@ def extract_archive(file_path, extract_dir):
                         with open(target_path, 'wb') as f:
                             f.write(zf.read(member.filename))
                         logger.debug(f"Extracted {member.filename} to {target_path}")
+                        with progress_lock:
+                            progress_bar.update(1)
+                            progress_bar.refresh()
                     except Exception as e:
                         logger.error(f"Failed to extract {member.filename}: {e}")
                         continue
+            with progress_lock:
+                progress_bar.close()
             logger.debug(f"Extracted all files to {target}")
 
         if not safe_remove(file_path):
@@ -538,7 +566,7 @@ def extract_archive(file_path, extract_dir):
                 if file.lower().endswith('.zip'):
                     nested_path = os.path.join(root, file)
                     logger.debug(f"Found nested zip: {nested_path}")
-                    nested_target = extract_archive(nested_path, root)
+                    nested_target = extract_archive(nested_path, root, position)
                     if nested_target is None:
                         logger.error(f"Failed to extract nested zip {file}")
                         return None
@@ -594,7 +622,7 @@ def process_attachment(attachment, downloaded_dict, db_file, max_retries, backof
                 time.sleep(delay)
             continue
         
-        extract_path = extract_archive(local_path, REPOSITORY_DIR)
+        extract_path = extract_archive(local_path, REPOSITORY_DIR, position)
         if extract_path:
             with _download_lock:
                 downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
@@ -716,7 +744,7 @@ def init_worker(jar):
 
 def main():
     args = parse_arguments()
-    setup_logging(getattr(logging, args.log_level), args.progress_only)
+    setup_logging(args.log_level, args.progress_only)
     
     logger = logging.getLogger(f"{__name__}.main")
     logger.info("Starting Czepeku downloader")
