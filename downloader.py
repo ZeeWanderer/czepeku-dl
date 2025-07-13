@@ -537,7 +537,7 @@ def parse_arguments():
                         help="Directory where extracted maps will be stored")
     parser.add_argument('--workers', type=int, default=8,
                         help="Number of parallel worker threads for downloading")
-    parser.add_argument('--max-retries', type=int, default=15,
+    parser.add_argument('--max-retries', type=int, default=5,
                         help="Maximum number of retries for failed requests")
     parser.add_argument('--backoff-factor', type=float, default=0.5,
                         help="Exponential backoff factor between retries")
