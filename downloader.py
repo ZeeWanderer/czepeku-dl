@@ -187,23 +187,27 @@ def load_downloaded_list():
         try:
             with open(DOWNLOADED_LIST_FILE, 'rb') as f:
                 data = pickle.load(f)
-            logger.debug(f"Loaded downloaded list: {list(data)[:10]}... (total {len(data)})")
-            return data
+            if isinstance(data, dict):
+                logger.debug(f"Loaded downloaded dict with {len(data)} entries")
+                return data
+            else:
+                logger.warning("Old format detected, starting fresh")
+                return {}
         except (pickle.PickleError, EOFError, Exception) as e:
             logger.error(f"Failed to load downloaded list: {e}. Starting fresh.")
-    logger.info("Starting with empty download list")
-    return set()
+    logger.info("Starting with empty download dict")
+    return {}
 
-def save_downloaded_list(downloaded_set):
+def save_downloaded_list(downloaded_dict):
     logger = logging.getLogger(f"{__name__}.save_downloaded_list")
-    logger.info(f"Saving downloaded list with {len(downloaded_set)} entries")
+    logger.info(f"Saving downloaded dict with {len(downloaded_dict)} entries")
     try:
         with open(DOWNLOADED_LIST_FILE + '.tmp', 'wb') as f:
-            pickle.dump(downloaded_set, f)
+            pickle.dump(downloaded_dict, f)
         os.replace(DOWNLOADED_LIST_FILE + '.tmp', DOWNLOADED_LIST_FILE)
-        logger.debug(f"Saved downloaded list successfully")
+        logger.debug(f"Saved downloaded dict successfully")
     except Exception as e:
-        logger.error(f"Failed to save downloaded list: {e}")
+        logger.error(f"Failed to save downloaded dict: {e}")
 
 def fetch_post_data(user_id, post_id, max_retries, backoff_factor, max_backoff):
     session = thread_local.session
@@ -403,11 +407,11 @@ def extract_archive(file_path, extract_dir):
     logger.info(f"Starting extraction of {os.path.basename(file_path)} to {extract_dir}")
     if shutdown_event.is_set():
         logger.debug("Shutdown event set, aborting extraction")
-        return False
+        return None
         
     if not zipfile.is_zipfile(file_path):
         logger.error(f"Invalid ZIP archive: {os.path.basename(file_path)}")
-        return False
+        return None
 
     try:
         filename = os.path.basename(file_path)
@@ -415,10 +419,23 @@ def extract_archive(file_path, extract_dir):
             logger.debug(f"Opened zip file {filename}")
             infolist = zf.infolist()
             logger.debug(f"Zip contents: {[m.filename for m in infolist]}")
-            top_dirs = {m.filename.split('/')[0] for m in infolist if '/' in m.filename and not m.filename.startswith(('__MACOSX', '.DS_Store', 'Grid'))}
+            junk_prefixes = ('__MACOSX', '.DS_Store')
+            supplement_names = ('Gridded', 'Gridless', 'Supplement')
+            top_dirs = set()
+            has_supplements = False
+            for m in infolist:
+                if '/' in m.filename:
+                    top = m.filename.split('/')[0]
+                    if any(top.startswith(j) for j in junk_prefixes):
+                        continue
+                    if any(top.startswith(s) for s in supplement_names):
+                        has_supplements = True
+                        continue
+                    top_dirs.add(top)
             logger.debug(f"Top directories: {top_dirs}")
+            logger.debug(f"Has supplements: {has_supplements}")
             
-            if len(top_dirs) == 1 and list(top_dirs)[0]:
+            if len(top_dirs) == 1 and not has_supplements and list(top_dirs)[0]:
                 target = extract_dir
             else:
                 base_name = os.path.splitext(filename)[0]
@@ -429,11 +446,11 @@ def extract_archive(file_path, extract_dir):
                 os.makedirs(target, exist_ok=True)
             except OSError as e:
                 logger.error(f"Failed to create target directory {target}: {e}")
-                return False
+                return None
 
             for member in infolist:
                 if shutdown_event.is_set():
-                    return False
+                    return None
                 if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
                     continue
                 target_path = os.path.join(target, member.filename)
@@ -464,18 +481,15 @@ def extract_archive(file_path, extract_dir):
             logger.debug(f"Extracted all files to {target}")
 
         if not safe_remove(file_path):
-            return False
+            return None
         logger.debug(f"Removed original zip file {file_path}")
         
-        if len(top_dirs) == 1 and list(top_dirs)[0]:
-            extract_path = os.path.join(target, list(top_dirs)[0])
-        else:
-            extract_path = target
+        extract_path = target
 
         for root, dirs, files in os.walk(extract_path, topdown=False):
             if shutdown_event.is_set():
                 logger.debug("Shutdown event set during cleaning, aborting")
-                return False
+                return None
             logger.debug(f"Cleaning directory: {root}")
             if '__MACOSX' in dirs:
                 path = os.path.join(root, '__MACOSX')
@@ -493,29 +507,30 @@ def extract_archive(file_path, extract_dir):
         for root, _, files in os.walk(extract_path):
             if shutdown_event.is_set():
                 logger.debug("Shutdown event set during nested extraction, aborting")
-                return False
+                return None
             logger.debug(f"Checking for nested zips in {root}")
             for file in files:
                 if file.lower().endswith('.zip'):
                     nested_path = os.path.join(root, file)
                     logger.debug(f"Found nested zip: {nested_path}")
-                    if extract_archive(nested_path, root):
-                        logger.debug(f"Successfully extracted nested zip {file}")
-                    else:
+                    nested_target = extract_archive(nested_path, root)
+                    if nested_target is None:
                         logger.error(f"Failed to extract nested zip {file}")
-                        return False
+                        return None
+                    else:
+                        logger.debug(f"Successfully extracted nested zip {file} to {nested_target}")
         logger.info(f"Finished extraction of {filename}")
-        return True
+        return target
         
     except zipfile.BadZipFile as e:
         logger.error(f"Bad ZIP archive: {filename} - {str(e)[:100]}")
-        return False
+        return None
         
     except Exception as e:
         logger.error(f"Extraction failed for {filename}: {str(e)[:100]}")
-        return False
+        return None
 
-def process_attachment(attachment, downloaded_set, max_retries, backoff_factor, max_backoff):
+def process_attachment(attachment, downloaded_dict, max_retries, backoff_factor, max_backoff):
     logger = logging.getLogger(f"{__name__}.process_attachment")
     logger.info(f"Starting process_attachment for {attachment.get('name')}")
     logger.debug(f"Attachment details: {json.dumps(attachment, indent=2)}")
@@ -526,7 +541,7 @@ def process_attachment(attachment, downloaded_set, max_retries, backoff_factor, 
     attachment_path = attachment['path']
     
     with _download_lock:
-        if attachment_path in downloaded_set:
+        if attachment_path in downloaded_dict:
             logger.info(f"Skipping already downloaded {filename}")
             return False
     
@@ -554,10 +569,11 @@ def process_attachment(attachment, downloaded_set, max_retries, backoff_factor, 
                 time.sleep(delay)
             continue
         
-        if extract_archive(local_path, REPOSITORY_DIR):
+        extract_path = extract_archive(local_path, REPOSITORY_DIR)
+        if extract_path:
             with _download_lock:
-                downloaded_set.add(attachment_path)
-                save_downloaded_list(downloaded_set)
+                downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
+                save_downloaded_list(downloaded_dict)
             logger.info(f"Successfully processed {filename}")
             position_queue.put(position)
             return True
@@ -704,8 +720,8 @@ def main():
     post_count = sum(len(posts) for posts in users_posts.values())
     logger.info(f"Loaded {user_count} users with {post_count} posts")
     
-    downloaded_set = load_downloaded_list()
-    logger.info(f"Loaded {len(downloaded_set)} previously downloaded files")
+    downloaded_dict = load_downloaded_list()
+    logger.info(f"Loaded {len(downloaded_dict)} previously downloaded files")
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -727,7 +743,7 @@ def main():
             listener.stop()
         sys.exit(0)
     
-    to_process = [att for att in attachments if att['path'] not in downloaded_set]
+    to_process = [att for att in attachments if att['path'] not in downloaded_dict]
     
     total_attachments = len(to_process)
     if total_attachments == 0:
@@ -749,7 +765,7 @@ def main():
                 future = executor.submit(
                     process_attachment,
                     attachment,
-                    downloaded_set,
+                    downloaded_dict,
                     args.max_retries,
                     args.backoff_factor,
                     args.max_backoff
