@@ -25,11 +25,12 @@ import weakref
 from queue import Queue
 from threading import Lock, RLock, Event
 from functools import partial
+import csv
 
 SERVICE = "patreon"
 USERS_POSTS_FILE = "users_posts.json"
 COOKIE_FILE = "cookies.txt"
-DOWNLOADED_LIST_FILE = "downloaded_files.pkl"
+DOWNLOADED_LIST_FILE = "downloaded_files.csv"
 DOWNLOAD_DIR = "downloads"
 REPOSITORY_DIR = "maps_repository"
 LOG_DIR = "logs"
@@ -183,31 +184,35 @@ def load_cookies(cookie_file):
 def load_downloaded_list():
     logger = logging.getLogger(f"{__name__}.load_downloaded_list")
     logger.info("Loading previously downloaded files list")
+    downloaded_dict = {}
     if os.path.exists(DOWNLOADED_LIST_FILE):
         try:
-            with open(DOWNLOADED_LIST_FILE, 'rb') as f:
-                data = pickle.load(f)
-            if isinstance(data, dict):
-                logger.debug(f"Loaded downloaded dict with {len(data)} entries")
-                return data
-            else:
-                logger.warning("Old format detected, starting fresh")
-                return {}
-        except (pickle.PickleError, EOFError, Exception) as e:
+            with open(DOWNLOADED_LIST_FILE, 'r', newline='') as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header == ['attachment_path', 'zip_name', 'extract_path']:
+                    for row in reader:
+                        if len(row) == 3:
+                            downloaded_dict[row[0]] = {'zip_name': row[1], 'extract_path': row[2]}
+            logger.debug(f"Loaded downloaded dict with {len(downloaded_dict)} entries")
+        except Exception as e:
             logger.error(f"Failed to load downloaded list: {e}. Starting fresh.")
-    logger.info("Starting with empty download dict")
-    return {}
+    else:
+        logger.info("Starting with empty download dict")
+    return downloaded_dict
 
-def save_downloaded_list(downloaded_dict):
-    logger = logging.getLogger(f"{__name__}.save_downloaded_list")
-    logger.info(f"Saving downloaded dict with {len(downloaded_dict)} entries")
+def append_to_downloaded_list(attachment_path, zip_name, extract_path):
+    logger = logging.getLogger(f"{__name__}.append_to_downloaded_list")
+    file_exists = os.path.exists(DOWNLOADED_LIST_FILE)
     try:
-        with open(DOWNLOADED_LIST_FILE + '.tmp', 'wb') as f:
-            pickle.dump(downloaded_dict, f)
-        os.replace(DOWNLOADED_LIST_FILE + '.tmp', DOWNLOADED_LIST_FILE)
-        logger.debug(f"Saved downloaded dict successfully")
+        with open(DOWNLOADED_LIST_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(['attachment_path', 'zip_name', 'extract_path'])
+            writer.writerow([attachment_path, zip_name, extract_path])
+        logger.debug(f"Appended {attachment_path} to downloaded list")
     except Exception as e:
-        logger.error(f"Failed to save downloaded dict: {e}")
+        logger.error(f"Failed to append to downloaded list: {e}")
 
 def fetch_post_data(user_id, post_id, max_retries, backoff_factor, max_backoff):
     session = thread_local.session
@@ -571,9 +576,8 @@ def process_attachment(attachment, downloaded_dict, max_retries, backoff_factor,
         
         extract_path = extract_archive(local_path, REPOSITORY_DIR)
         if extract_path:
-            with _download_lock:
-                downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
-                save_downloaded_list(downloaded_dict)
+            downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
+            append_to_downloaded_list(attachment_path, filename, extract_path)
             logger.info(f"Successfully processed {filename}")
             position_queue.put(position)
             return True
