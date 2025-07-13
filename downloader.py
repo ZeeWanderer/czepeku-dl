@@ -12,9 +12,10 @@ import http.client
 from requests.exceptions import ChunkedEncodingError
 import shutil
 import re
+from colorlog import ColoredFormatter
 
 SERVICE = "patreon"
-USERS_POSTS_FILE = "users_posts.json"  # JSON file mapping user IDs to post ID lists
+USERS_POSTS_FILE = "users_posts.json" 
 COOKIE_FILE = "cookies.txt"
 DOWNLOADED_LIST_FILE = "downloaded_files.pkl"
 DOWNLOAD_DIR = "downloads"
@@ -23,16 +24,39 @@ REPOSITORY_DIR = "maps_repository"
 
 def setup_logging():
     """
-    Configures the root logger to output debug and higher level logs to both a file and the console.
+    Configures the root logger to output colored debug and higher level logs to both a file and the console.
     """
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler("patreon_downloader.log", mode='a'),
-            logging.StreamHandler()
-        ]
+    console_formatter = ColoredFormatter(
+        "%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt=None,
+        reset=True,
+        log_colors={
+            'DEBUG': 'cyan',
+            'INFO': 'green',
+            'WARNING': 'yellow',
+            'ERROR': 'red',
+            'CRITICAL': 'bold_red',
+        }
     )
+
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    console_handler.setFormatter(console_formatter)
+
+    file_handler = logging.FileHandler("patreon_downloader.log", mode='a')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(file_formatter)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    root.addHandler(console_handler)
+    root.addHandler(file_handler)
 
 
 def load_users_posts():
@@ -52,7 +76,7 @@ def load_users_posts():
         logger.info(f"Loaded users-posts mapping for {len(data)} users")
         return data
     except Exception as e:
-        logger.error(f"Failed to load {USERS_POSTS_FILE}: {e}")
+        logger.critical(f"Failed to load {USERS_POSTS_FILE}: {e}")
         exit(1)
 
 
