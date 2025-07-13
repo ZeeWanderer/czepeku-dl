@@ -174,7 +174,8 @@ def save_downloaded_list(downloaded_set):
     except Exception as e:
         logger.error(f"Failed to save downloaded list: {e}")
 
-def fetch_post_data(session, user_id, post_id, max_retries, backoff_factor, max_backoff):
+def fetch_post_data(user_id, post_id, max_retries, backoff_factor, max_backoff):
+    session = thread_local.session
     logger = logging.getLogger(f"{__name__}.fetch_post_data")
     logger.info(f"Fetching post {post_id} for user {user_id}")
     if shutdown_event.is_set():
@@ -233,7 +234,7 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
     while not shutdown_event.is_set() and retry_count < max_retries:
         logger.info(f"Starting download attempt {retry_count + 1} for {filename}")
         try:
-            with session.get(url, stream=True, headers=headers, timeout=(10, 10)) as r:
+            with session.get(url, stream=True, headers=headers, timeout=(10, 5)) as r:
                 r.raise_for_status()
                 
                 if total_size is None:
@@ -416,6 +417,10 @@ def extract_archive(file_path, extract_dir):
         logger.info(f"Finished extraction of {filename}")
         return True
         
+    except zipfile.BadZipFile as e:
+        logger.error(f"Bad ZIP archive: {filename} - {str(e)[:100]}")
+        return False
+        
     except Exception as e:
         logger.error(f"Extraction failed for {filename}: {str(e)[:100]}")
         return False
@@ -476,27 +481,40 @@ def process_attachment(attachment, downloaded_set, max_retries, backoff_factor, 
     position_queue.put(position)
     return False
 
-def collect_attachments(session, users_posts, max_retries, backoff_factor, max_backoff):
+def collect_attachments(executor, users_posts, max_retries, backoff_factor, max_backoff):
     logger = logging.getLogger(f"{__name__}.collect_attachments")
     logger.info("Starting to collect attachments")
     if shutdown_event.is_set():
         return []
         
+    post_tasks = [(user_id, post_id) for user_id, post_ids in users_posts.items() for post_id in post_ids]
+    post_count = len(post_tasks)
+    
     attachments = []
-    post_count = sum(len(posts) for posts in users_posts.values())
+    fetch_futures = [executor.submit(fetch_post_data, user_id, post_id, max_retries, backoff_factor, max_backoff) for user_id, post_id in post_tasks]
+    not_done = set(fetch_futures)
     
     with tqdm(total=post_count, desc="Fetching posts", leave=True, position=0, disable=logger.level > logging.INFO) as post_bar:
-        for user_id, post_ids in users_posts.items():
-            for post_id in post_ids:
-                if shutdown_event.is_set():
-                    return attachments
-                post_data = fetch_post_data(session, user_id, post_id, max_retries, backoff_factor, max_backoff)
-                if post_data:
-                    for attachment in post_data.get('attachments', []):
-                        if attachment.get('name_extension', '').lower() == '.zip':
-                            attachments.append(attachment)
-                post_bar.update(1)
-                post_bar.refresh()
+        while not_done and not shutdown_event.is_set():
+            done, not_done = wait(not_done, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done:
+                try:
+                    post_data = future.result()
+                    if post_data:
+                        for attachment in post_data.get('attachments', []):
+                            if attachment.get('name_extension', '').lower() == '.zip':
+                                attachments.append(attachment)
+                except Exception as e:
+                    logger.error(f"Error fetching post: {str(e)[:100]}")
+                with progress_lock:
+                    post_bar.update(1)
+                    post_bar.refresh()
+                    
+            if shutdown_event.is_set():
+                logger.warning("Cancelling pending fetch tasks")
+                for future in not_done:
+                    future.cancel()
+    
     logger.info(f"Collected {len(attachments)} attachments")
     return attachments
 
@@ -564,9 +582,6 @@ def main():
     os.makedirs(REPOSITORY_DIR, exist_ok=True)
     
     jar = load_cookies(COOKIE_FILE)
-    main_session = requests.Session()
-    if jar is not None:
-        main_session.cookies = jar
     
     users_posts = load_users_posts()
     user_count = len(users_posts)
@@ -579,10 +594,17 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    attachments = collect_attachments(main_session, users_posts, args.max_retries, args.backoff_factor, args.max_backoff)
+    init_func = partial(init_worker, jar)
+    
+    executor = DaemonThreadPoolExecutor(max_workers=args.workers, initializer=init_func)
+    
+    attachments = collect_attachments(executor, users_posts, args.max_retries, args.backoff_factor, args.max_backoff)
     
     if shutdown_event.is_set():
         logger.warning("Shutdown during attachment collection")
+        executor.shutdown(wait=False)
+        if listener:
+            listener.stop()
         sys.exit(0)
     
     to_process = [att for att in attachments if att['path'] not in downloaded_set]
@@ -590,16 +612,15 @@ def main():
     total_attachments = len(to_process)
     if total_attachments == 0:
         logger.info("No new attachments found")
+        executor.shutdown(wait=False)
+        if listener:
+            listener.stop()
         sys.exit(0)
     
     logger.info(f"Processing {total_attachments} attachments")
     
-    init_func = partial(init_worker, jar)
-    
     completed_count = 0
     failed_count = 0
-    
-    executor = DaemonThreadPoolExecutor(max_workers=args.workers, initializer=init_func)
     
     try:
         futures = [executor.submit(
@@ -640,10 +661,9 @@ def main():
     finally:
         executor.shutdown(wait=False)
         logger.info(f"Processing complete: {completed_count} succeeded, {failed_count} failed")
-        main_session.close()
-        logger.info("Shutdown complete")
         if listener:
             listener.stop()
+        logger.info("Shutdown complete")
 
 if __name__ == '__main__':
     main()
