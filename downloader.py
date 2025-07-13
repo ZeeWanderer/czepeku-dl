@@ -25,12 +25,12 @@ import weakref
 from queue import Queue
 from threading import Lock, RLock, Event
 from functools import partial
-import csv
+import sqlite3
 
 SERVICE = "patreon"
 USERS_POSTS_FILE = "users_posts.json"
 COOKIE_FILE = "cookies.txt"
-DOWNLOADED_LIST_FILE = "downloaded_files.csv"
+DOWNLOADED_LIST_FILE = "downloaded_files.db"
 DOWNLOAD_DIR = "downloads"
 REPOSITORY_DIR = "maps_repository"
 LOG_DIR = "logs"
@@ -181,38 +181,39 @@ def load_cookies(cookie_file):
     
     return jar
 
-def load_downloaded_list():
+def init_downloaded_db(db_file):
+    conn = sqlite3.connect(db_file)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS downloaded 
+                 (attachment_path TEXT PRIMARY KEY, zip_name TEXT, extract_path TEXT)''')
+    conn.commit()
+    conn.close()
+
+def load_downloaded_list(db_file):
     logger = logging.getLogger(f"{__name__}.load_downloaded_list")
     logger.info("Loading previously downloaded files list")
+    init_downloaded_db(db_file)
     downloaded_dict = {}
-    if os.path.exists(DOWNLOADED_LIST_FILE):
-        try:
-            with open(DOWNLOADED_LIST_FILE, 'r', newline='') as f:
-                reader = csv.reader(f)
-                header = next(reader, None)
-                if header == ['attachment_path', 'zip_name', 'extract_path']:
-                    for row in reader:
-                        if len(row) == 3:
-                            downloaded_dict[row[0]] = {'zip_name': row[1], 'extract_path': row[2]}
-            logger.debug(f"Loaded downloaded dict with {len(downloaded_dict)} entries")
-        except Exception as e:
-            logger.error(f"Failed to load downloaded list: {e}. Starting fresh.")
-    else:
-        logger.info("Starting with empty download dict")
+    with _download_lock:
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute('SELECT attachment_path, zip_name, extract_path FROM downloaded')
+        for row in c:
+            downloaded_dict[row[0]] = {'zip_name': row[1], 'extract_path': row[2]}
+        conn.close()
+    logger.debug(f"Loaded downloaded dict with {len(downloaded_dict)} entries")
     return downloaded_dict
 
-def append_to_downloaded_list(attachment_path, zip_name, extract_path):
+def append_to_downloaded_list(db_file, attachment_path, zip_name, extract_path):
     logger = logging.getLogger(f"{__name__}.append_to_downloaded_list")
-    file_exists = os.path.exists(DOWNLOADED_LIST_FILE)
-    try:
-        with open(DOWNLOADED_LIST_FILE, 'a', newline='') as f:
-            writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-            if not file_exists:
-                writer.writerow(['attachment_path', 'zip_name', 'extract_path'])
-            writer.writerow([attachment_path, zip_name, extract_path])
-        logger.debug(f"Appended {attachment_path} to downloaded list")
-    except Exception as e:
-        logger.error(f"Failed to append to downloaded list: {e}")
+    with _download_lock:
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO downloaded (attachment_path, zip_name, extract_path) VALUES (?, ?, ?)',
+                  (attachment_path, zip_name, extract_path))
+        conn.commit()
+        conn.close()
+    logger.debug(f"Appended {attachment_path} to downloaded list")
 
 def fetch_post_data(user_id, post_id, max_retries, backoff_factor, max_backoff):
     session = thread_local.session
@@ -424,6 +425,16 @@ def extract_archive(file_path, extract_dir):
             logger.debug(f"Opened zip file {filename}")
             infolist = zf.infolist()
             logger.debug(f"Zip contents: {[m.filename for m in infolist]}")
+            logger.debug("Zip structure:")
+            all_paths = sorted([m.filename for m in infolist])
+            for path in all_paths:
+                parts = path.split('/')
+                indent = '  ' * (len(parts) - 1)
+                name = parts[-1]
+                if not name and len(parts) > 1:
+                    indent = '  ' * (len(parts) - 2)
+                    name = parts[-2] + '/'
+                logger.debug(f"{indent}- {name}")
             junk_prefixes = ('__MACOSX', '.DS_Store')
             supplement_names = ('Gridded', 'Gridless', 'Supplement')
             top_dirs = set()
@@ -535,7 +546,7 @@ def extract_archive(file_path, extract_dir):
         logger.error(f"Extraction failed for {filename}: {str(e)[:100]}")
         return None
 
-def process_attachment(attachment, downloaded_dict, max_retries, backoff_factor, max_backoff):
+def process_attachment(attachment, downloaded_dict, db_file, max_retries, backoff_factor, max_backoff):
     logger = logging.getLogger(f"{__name__}.process_attachment")
     logger.info(f"Starting process_attachment for {attachment.get('name')}")
     logger.debug(f"Attachment details: {json.dumps(attachment, indent=2)}")
@@ -578,7 +589,7 @@ def process_attachment(attachment, downloaded_dict, max_retries, backoff_factor,
         if extract_path:
             with _download_lock:
                 downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
-                append_to_downloaded_list(attachment_path, filename, extract_path)
+                append_to_downloaded_list(db_file, attachment_path, filename, extract_path)
             logger.info(f"Successfully processed {filename}")
             position_queue.put(position)
             return True
@@ -701,11 +712,12 @@ def main():
     logger = logging.getLogger(f"{__name__}.main")
     logger.info("Starting Czepeku downloader")
     
-    global USERS_POSTS_FILE, COOKIE_FILE, DOWNLOAD_DIR, REPOSITORY_DIR, position_queue
+    global USERS_POSTS_FILE, COOKIE_FILE, DOWNLOAD_DIR, REPOSITORY_DIR, position_queue, DOWNLOADED_LIST_FILE
     USERS_POSTS_FILE = args.users_posts
     COOKIE_FILE = args.cookies
     DOWNLOAD_DIR = args.download_dir
     REPOSITORY_DIR = args.repo_dir
+    DOWNLOADED_LIST_FILE = "downloaded_files.db"
     position_queue = Queue()
     for i in range(1, args.workers + 1):
         position_queue.put(i)
@@ -743,7 +755,7 @@ def main():
     post_count = sum(len(posts) for posts in users_posts.values())
     logger.info(f"Loaded {user_count} users with {post_count} posts")
     
-    downloaded_dict = load_downloaded_list()
+    downloaded_dict = load_downloaded_list(DOWNLOADED_LIST_FILE)
     logger.info(f"Loaded {len(downloaded_dict)} previously downloaded files")
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -766,7 +778,8 @@ def main():
             listener.stop()
         sys.exit(0)
     
-    to_process = [att for att in attachments if att['path'] not in downloaded_dict]
+    with _download_lock:
+        to_process = [att for att in attachments if att['path'] not in downloaded_dict]
     
     total_attachments = len(to_process)
     if total_attachments == 0:
@@ -789,6 +802,7 @@ def main():
                     process_attachment,
                     attachment,
                     downloaded_dict,
+                    DOWNLOADED_LIST_FILE,
                     args.max_retries,
                     args.backoff_factor,
                     args.max_backoff
