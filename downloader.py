@@ -64,6 +64,15 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
             self._threads.add(t)
             _thread._threads_queues[t] = self._work_queue
 
+class TqdmHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
 def setup_logging(log_level, progress_only):
     global listener
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -80,7 +89,7 @@ def setup_logging(log_level, progress_only):
             'CRITICAL': 'bold_red',
         }
     )
-    console_handler = logging.StreamHandler()
+    console_handler = TqdmHandler()
     console_handler.setLevel(log_level)
     console_handler.setFormatter(console_formatter)
 
@@ -110,17 +119,24 @@ def setup_logging(log_level, progress_only):
     root_logger.addHandler(queue_handler)
 
     if os.path.exists(log_path) and os.path.getsize(log_path) > 0:
-        file_handler.doRollover()
+        try:
+            file_handler.doRollover()
+        except Exception as e:
+            root_logger.error(f"Failed to rollover log file: {e}")
 
 def load_config_file(filename):
     logger = logging.getLogger(f"{__name__}.load_config_file")
     if not os.path.exists(filename):
         logger.critical(f"Config file {filename} not found")
         return None
-    with open(filename, 'r') as f:
-        content = f.read()
-    content = re.sub(r'//.*|/\*[\s\S]*?\*/', '', content)
-    return content
+    try:
+        with open(filename, 'r') as f:
+            content = f.read()
+        content = re.sub(r'//.*|/\*[\s\S]*?\*/', '', content)
+        return content
+    except Exception as e:
+        logger.critical(f"Failed to read config file {filename}: {e}")
+        return None
 
 def load_users_posts():
     logger = logging.getLogger(f"{__name__}.load_users_posts")
@@ -128,7 +144,13 @@ def load_users_posts():
     content = load_config_file(USERS_POSTS_FILE)
     if content is None:
         sys.exit(1)
-    return json.loads(content)
+    try:
+        data = json.loads(content)
+        logger.debug(f"Loaded users_posts data: {json.dumps(data, indent=2)}")
+        return data
+    except json.JSONDecodeError as e:
+        logger.critical(f"Invalid JSON in {USERS_POSTS_FILE}: {e}")
+        sys.exit(1)
 
 def load_cookies(cookie_file):
     logger = logging.getLogger(f"{__name__}.load_cookies")
@@ -137,17 +159,22 @@ def load_cookies(cookie_file):
     expired_count = 0
     
     if os.path.exists(cookie_file):
-        jar = MozillaCookieJar(cookie_file)
-        jar.load()
-        
-        current_time = time.time()
-        for cookie in list(jar):
-            if cookie.expires and cookie.expires < current_time:
-                expired_count += 1
-                logger.warning(f"Expired cookie: {cookie.name} (expired {datetime.fromtimestamp(cookie.expires).strftime('%Y-%m-%d')})")
-        
-        if expired_count > 0:
-            logger.warning(f"Found {expired_count} expired cookies - you may need to update your cookie file")
+        try:
+            jar = MozillaCookieJar(cookie_file)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            
+            current_time = time.time()
+            for cookie in list(jar):
+                if cookie.expires and cookie.expires < current_time:
+                    expired_count += 1
+                    logger.warning(f"Expired cookie: {cookie.name} (expired {datetime.fromtimestamp(cookie.expires).strftime('%Y-%m-%d')})")
+            
+            if expired_count > 0:
+                logger.warning(f"Found {expired_count} expired cookies - you may need to update your cookie file")
+            logger.debug(f"Loaded cookies: {[c.name for c in jar]}")
+        except Exception as e:
+            logger.error(f"Failed to load cookies: {e}")
+            jar = None
     else:
         logger.warning(f"Cookie file {cookie_file} not found. Proceeding without cookies.")
     
@@ -159,9 +186,11 @@ def load_downloaded_list():
     if os.path.exists(DOWNLOADED_LIST_FILE):
         try:
             with open(DOWNLOADED_LIST_FILE, 'rb') as f:
-                return pickle.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load downloaded list: {e}")
+                data = pickle.load(f)
+            logger.debug(f"Loaded downloaded list: {list(data)[:10]}... (total {len(data)})")
+            return data
+        except (pickle.PickleError, EOFError, Exception) as e:
+            logger.error(f"Failed to load downloaded list: {e}. Starting fresh.")
     logger.info("Starting with empty download list")
     return set()
 
@@ -169,8 +198,10 @@ def save_downloaded_list(downloaded_set):
     logger = logging.getLogger(f"{__name__}.save_downloaded_list")
     logger.info(f"Saving downloaded list with {len(downloaded_set)} entries")
     try:
-        with open(DOWNLOADED_LIST_FILE, 'wb') as f:
+        with open(DOWNLOADED_LIST_FILE + '.tmp', 'wb') as f:
             pickle.dump(downloaded_set, f)
+        os.replace(DOWNLOADED_LIST_FILE + '.tmp', DOWNLOADED_LIST_FILE)
+        logger.debug(f"Saved downloaded list successfully")
     except Exception as e:
         logger.error(f"Failed to save downloaded list: {e}")
 
@@ -190,7 +221,9 @@ def fetch_post_data(user_id, post_id, max_retries, backoff_factor, max_backoff):
         try:
             response = session.get(url, timeout=15)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            logger.debug(f"Fetched post data for {post_id}: {json.dumps(data, indent=2)}")
+            return data
         except RequestException as e:
             if shutdown_event.is_set():
                 return None
@@ -209,7 +242,12 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
         return False
         
     temp_path = path + '.part'
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as e:
+        logger.error(f"Failed to create directory for {path}: {e}")
+        return False
+    
     downloaded = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
     
     headers = {'Range': f'bytes={downloaded}-'} if downloaded else {}
@@ -218,21 +256,26 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
     initial_downloaded = downloaded
     filename = os.path.basename(path)
 
-    progress_bar = tqdm(
-        total=total_size,
-        initial=downloaded,
-        unit='B',
-        unit_scale=True,
-        desc=filename,
-        disable=logger.level > logging.INFO,
-        leave=False,
-        mininterval=0.5,
-        position=position,
-        dynamic_ncols=True
-    )
+    try:
+        progress_bar = tqdm(
+            total=total_size,
+            initial=downloaded,
+            unit='B',
+            unit_scale=True,
+            desc=filename,
+            disable=logger.level > logging.INFO,
+            leave=False,
+            mininterval=0.5,
+            position=position,
+            dynamic_ncols=True
+        )
+    except Exception as e:
+        logger.error(f"Failed to create progress bar for {filename}: {e}")
+        return False
 
     while not shutdown_event.is_set() and retry_count < max_retries:
-        logger.info(f"Starting download attempt {retry_count + 1} for {filename}")
+        logger.info(f"Starting download attempt {retry_count + 1}/{max_retries} for {filename}")
+        logger.debug(f"Download headers: {headers}")
         try:
             with session.get(url, stream=True, headers=headers, timeout=(10, 5)) as r:
                 r.raise_for_status()
@@ -268,7 +311,11 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
                     with progress_lock:
                         progress_bar.close()
                     logger.info(f"Download completed for {filename}")
-                    os.rename(temp_path, path)
+                    try:
+                        os.rename(temp_path, path)
+                    except OSError as e:
+                        logger.error(f"Failed to rename temp file for {filename}: {e}")
+                        return False
                     return True
                 headers['Range'] = f'bytes={downloaded}-'
 
@@ -284,7 +331,11 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
                     with progress_lock:
                         progress_bar.close()
                     logger.info(f"Assuming download complete for {filename} due to 416 error with downloaded {downloaded} bytes")
-                    os.rename(temp_path, path)
+                    try:
+                        os.rename(temp_path, path)
+                    except OSError as e:
+                        logger.error(f"Failed to rename temp file for {filename}: {e}")
+                        return False
                     return True
             retry_count += 1
             if retry_count < max_retries and not shutdown_event.is_set():
@@ -309,6 +360,16 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
                     progress_bar.close()
                 logger.error(f"Download failed for {filename} after {max_retries} retries: {str(e)[:100]}")
                 return False
+        except Exception as e:
+            logger.error(f"Unexpected error during download of {filename}: {e}")
+            retry_count += 1
+            if retry_count < max_retries and not shutdown_event.is_set():
+                delay = min(backoff_factor * (2 ** (retry_count - 1)), max_backoff)
+                time.sleep(delay)
+            else:
+                with progress_lock:
+                    progress_bar.close()
+                return False
     
     with progress_lock:
         progress_bar.close()
@@ -330,6 +391,12 @@ def safe_remove(path):
             else:
                 logger.error(f"Failed to remove {path} after {max_attempts} attempts: {str(e)[:100]}")
                 return False
+        except FileNotFoundError:
+            logger.debug(f"File {path} not found for removal")
+            return True
+        except Exception as e:
+            logger.error(f"Unexpected error removing {path}: {e}")
+            return False
     return False
 
 def extract_archive(file_path, extract_dir):
@@ -348,6 +415,7 @@ def extract_archive(file_path, extract_dir):
         with zipfile.ZipFile(file_path) as zf:
             logger.debug(f"Opened zip file {filename}")
             infolist = zf.infolist()
+            logger.debug(f"Zip contents: {[m.filename for m in infolist]}")
             top_dirs = {m.filename.split('/')[0] for m in infolist if '/' in m.filename and not m.filename.startswith(('__MACOSX/', '.DS_Store'))}
             logger.debug(f"Top directories: {top_dirs}")
             
@@ -358,22 +426,42 @@ def extract_archive(file_path, extract_dir):
                 target = os.path.join(extract_dir, base_name)
             
             logger.debug(f"Determined target directory: {target}")
-            os.makedirs(target, exist_ok=True)
+            try:
+                os.makedirs(target, exist_ok=True)
+            except OSError as e:
+                logger.error(f"Failed to create target directory {target}: {e}")
+                return False
 
             for member in infolist:
+                if shutdown_event.is_set():
+                    return False
                 if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
                     continue
                 target_path = os.path.join(target, member.filename)
                 target_dir = os.path.dirname(target_path)
-                os.makedirs(target_dir, exist_ok=True)
+                try:
+                    os.makedirs(target_dir, exist_ok=True)
+                except OSError as e:
+                    logger.error(f"Failed to create directory {target_dir}: {e}")
+                    continue
                 if not member.is_dir():
                     if os.path.exists(target_path):
                         if os.path.isdir(target_path):
-                            shutil.rmtree(target_path)
+                            try:
+                                shutil.rmtree(target_path, ignore_errors=True)
+                            except Exception as e:
+                                logger.error(f"Failed to remove directory {target_path}: {e}")
+                                continue
                         else:
-                            os.remove(target_path)
-                    with open(target_path, 'wb') as f:
-                        f.write(zf.read(member.filename))
+                            if not safe_remove(target_path):
+                                continue
+                    try:
+                        with open(target_path, 'wb') as f:
+                            f.write(zf.read(member.filename))
+                        logger.debug(f"Extracted {member.filename} to {target_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to extract {member.filename}: {e}")
+                        continue
             logger.debug(f"Extracted all files to {target}")
 
         if not safe_remove(file_path):
@@ -392,13 +480,16 @@ def extract_archive(file_path, extract_dir):
             logger.debug(f"Cleaning directory: {root}")
             if '__MACOSX' in dirs:
                 path = os.path.join(root, '__MACOSX')
-                shutil.rmtree(path, ignore_errors=True)
+                try:
+                    shutil.rmtree(path, ignore_errors=True)
+                except Exception as e:
+                    logger.error(f"Failed to remove __MACOSX directory at {path}: {e}")
                 logger.debug(f"Removed __MACOSX directory at {path}")
             for file in files:
                 if file == '.DS_Store':
                     path = os.path.join(root, file)
-                    os.remove(path)
-                    logger.debug(f"Removed .DS_Store file at {path}")
+                    if not safe_remove(path):
+                        continue
         
         for root, _, files in os.walk(extract_path):
             if shutdown_event.is_set():
@@ -428,6 +519,7 @@ def extract_archive(file_path, extract_dir):
 def process_attachment(attachment, downloaded_set, max_retries, backoff_factor, max_backoff):
     logger = logging.getLogger(f"{__name__}.process_attachment")
     logger.info(f"Starting process_attachment for {attachment.get('name')}")
+    logger.debug(f"Attachment details: {json.dumps(attachment, indent=2)}")
     if shutdown_event.is_set():
         return False
         
@@ -491,31 +583,43 @@ def collect_attachments(executor, users_posts, max_retries, backoff_factor, max_
     post_count = len(post_tasks)
     
     attachments = []
-    fetch_futures = [executor.submit(fetch_post_data, user_id, post_id, max_retries, backoff_factor, max_backoff) for user_id, post_id in post_tasks]
+    fetch_futures = []
+    for user_id, post_id in post_tasks:
+        try:
+            future = executor.submit(fetch_post_data, user_id, post_id, max_retries, backoff_factor, max_backoff)
+            fetch_futures.append(future)
+        except Exception as e:
+            logger.error(f"Failed to submit fetch task for post {post_id}: {e}")
+    
     not_done = set(fetch_futures)
     
-    with tqdm(total=post_count, desc="Fetching posts", leave=True, position=0, disable=logger.level > logging.INFO) as post_bar:
-        while not_done and not shutdown_event.is_set():
-            done, not_done = wait(not_done, timeout=0.5, return_when=FIRST_COMPLETED)
-            for future in done:
-                try:
-                    post_data = future.result()
-                    if post_data:
-                        for attachment in post_data.get('attachments', []):
-                            if attachment.get('name_extension', '').lower() == '.zip':
-                                attachments.append(attachment)
-                except Exception as e:
-                    logger.error(f"Error fetching post: {str(e)[:100]}")
-                with progress_lock:
-                    post_bar.update(1)
-                    post_bar.refresh()
-                    
-            if shutdown_event.is_set():
-                logger.warning("Cancelling pending fetch tasks")
-                for future in not_done:
-                    future.cancel()
+    try:
+        with tqdm(total=post_count, desc="Fetching posts", leave=True, position=0, disable=logger.level > logging.INFO) as post_bar:
+            while not_done and not shutdown_event.is_set():
+                done, not_done = wait(not_done, timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done:
+                    try:
+                        post_data = future.result()
+                        if post_data:
+                            for attachment in post_data.get('attachments', []):
+                                if attachment.get('name', '').lower().endswith('.zip'):
+                                    logger.debug(f"Found ZIP attachment: {attachment.get('name')}, path: {attachment['path']}")
+                                    attachments.append(attachment)
+                    except Exception as e:
+                        logger.error(f"Error fetching post: {str(e)[:100]}")
+                    with progress_lock:
+                        post_bar.update(1)
+                        post_bar.refresh()
+                        
+                if shutdown_event.is_set():
+                    logger.warning("Cancelling pending fetch tasks")
+                    for future in not_done:
+                        future.cancel()
+    except Exception as e:
+        logger.error(f"Error in attachment collection progress: {e}")
     
     logger.info(f"Collected {len(attachments)} attachments")
+    logger.debug(f"Attachment list: {[att.get('name') for att in attachments]}")
     return attachments
 
 def parse_arguments():
@@ -537,15 +641,21 @@ def parse_arguments():
                         help="Directory where extracted maps will be stored")
     parser.add_argument('--workers', type=int, default=8,
                         help="Number of parallel worker threads for downloading")
-    parser.add_argument('--max-retries', type=int, default=5,
+    parser.add_argument('--max-retries', type=int, default=15,
                         help="Maximum number of retries for failed requests")
     parser.add_argument('--backoff-factor', type=float, default=0.5,
                         help="Exponential backoff factor between retries")
     parser.add_argument('--max-backoff', type=int, default=10,
                         help="Maximum backoff delay in seconds between retries")
-    parser.add_argument('--show-console-logs', action='store_true',
+    parser.add_argument('--progress-only', action='store_true',
                         help="Show logs on console in addition to file (default: False)")
-    return parser.parse_args()
+    try:
+        args = parser.parse_args()
+        logger.debug(f"Parsed arguments: {vars(args)}")
+        return args
+    except SystemExit:
+        logger.critical("Argument parsing failed")
+        sys.exit(1)
 
 def signal_handler(signum, frame):
     logger = logging.getLogger(f"{__name__}.signal_handler")
@@ -553,13 +663,16 @@ def signal_handler(signum, frame):
     shutdown_event.set()
 
 def init_worker(jar):
-    thread_local.session = requests.Session()
-    if jar is not None:
-        thread_local.session.cookies = jar
+    try:
+        thread_local.session = requests.Session()
+        if jar is not None:
+            thread_local.session.cookies = jar
+    except Exception as e:
+        logging.getLogger(f"{__name__}.init_worker").error(f"Failed to initialize session: {e}")
 
 def main():
     args = parse_arguments()
-    setup_logging(getattr(logging, args.log_level), not args.show_console_logs)
+    setup_logging(getattr(logging, args.log_level), args.progress_only)
     
     logger = logging.getLogger(f"{__name__}.main")
     logger.info("Starting Czepeku downloader")
@@ -578,8 +691,12 @@ def main():
     logger.info(f"Retry settings: max_retries={args.max_retries}, backoff_factor={args.backoff_factor}, max_backoff={args.max_backoff}")
     logger.info(f"Worker threads: {args.workers}")
     
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(REPOSITORY_DIR, exist_ok=True)
+    try:
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        os.makedirs(REPOSITORY_DIR, exist_ok=True)
+    except OSError as e:
+        logger.critical(f"Failed to create directories: {e}")
+        sys.exit(1)
     
     jar = load_cookies(COOKIE_FILE)
     
@@ -596,7 +713,11 @@ def main():
     
     init_func = partial(init_worker, jar)
     
-    executor = DaemonThreadPoolExecutor(max_workers=args.workers, initializer=init_func)
+    try:
+        executor = DaemonThreadPoolExecutor(max_workers=args.workers, initializer=init_func)
+    except Exception as e:
+        logger.critical(f"Failed to create executor: {e}")
+        sys.exit(1)
     
     attachments = collect_attachments(executor, users_posts, args.max_retries, args.backoff_factor, args.max_backoff)
     
@@ -623,39 +744,49 @@ def main():
     failed_count = 0
     
     try:
-        futures = [executor.submit(
-            process_attachment,
-            attachment,
-            downloaded_set,
-            args.max_retries,
-            args.backoff_factor,
-            args.max_backoff
-        ) for attachment in to_process]
+        futures = []
+        for attachment in to_process:
+            try:
+                future = executor.submit(
+                    process_attachment,
+                    attachment,
+                    downloaded_set,
+                    args.max_retries,
+                    args.backoff_factor,
+                    args.max_backoff
+                )
+                futures.append(future)
+            except Exception as e:
+                logger.error(f"Failed to submit process task for {attachment.get('name')}: {e}")
+                failed_count += 1
         
         not_done = set(futures)
-        with tqdm(total=total_attachments, desc="Overall progress", leave=True, position=0, disable=logger.level > logging.INFO) as overall_progress:
-            while not_done and not shutdown_event.is_set():
-                logger.debug(f"Waiting for {len(not_done)} remaining tasks")
-                done, not_done = wait(not_done, timeout=0.5, return_when=FIRST_COMPLETED)
-                logger.debug(f"Processed {len(done)} tasks this iteration, {len(not_done)} remaining")
-                for future in done:
-                    try:
-                        success = future.result()
-                        if success:
-                            completed_count += 1
-                        else:
+        try:
+            with tqdm(total=total_attachments, desc="Overall progress", leave=True, position=0, disable=logger.level > logging.INFO) as overall_progress:
+                while not_done and not shutdown_event.is_set():
+                    logger.debug(f"Waiting for {len(not_done)} remaining tasks")
+                    done, not_done = wait(not_done, timeout=0.5, return_when=FIRST_COMPLETED)
+                    logger.debug(f"Processed {len(done)} tasks this iteration, {len(not_done)} remaining")
+                    for future in done:
+                        try:
+                            success = future.result()
+                            if success:
+                                completed_count += 1
+                            else:
+                                failed_count += 1
+                        except Exception as e:
+                            logger.error(f"Attachment processing failed: {str(e)[:100]}")
                             failed_count += 1
-                    except Exception as e:
-                        logger.error(f"Attachment processing failed: {str(e)[:100]}")
-                        failed_count += 1
-                    with progress_lock:
-                        overall_progress.update(1)
-                        overall_progress.refresh()
-                        
-                if shutdown_event.is_set():
-                    logger.warning("Cancelling pending tasks")
-                    for future in not_done:
-                        future.cancel()
+                        with progress_lock:
+                            overall_progress.update(1)
+                            overall_progress.refresh()
+                            
+                    if shutdown_event.is_set():
+                        logger.warning("Cancelling pending tasks")
+                        for future in not_done:
+                            future.cancel()
+        except Exception as e:
+            logger.error(f"Error in overall progress: {e}")
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
     finally:
