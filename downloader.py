@@ -415,7 +415,7 @@ def extract_archive(file_path, extract_dir):
             logger.debug(f"Opened zip file {filename}")
             infolist = zf.infolist()
             logger.debug(f"Zip contents: {[m.filename for m in infolist]}")
-            top_dirs = {m.filename.split('/')[0] for m in infolist if '/' in m.filename and not m.filename.startswith(('__MACOSX/', '.DS_Store'))}
+            top_dirs = {m.filename.split('/')[0] for m in infolist if '/' in m.filename and not m.filename.startswith(('__MACOSX', '.DS_Store'))}
             logger.debug(f"Top directories: {top_dirs}")
             
             if len(top_dirs) == 1 and list(top_dirs)[0]:
