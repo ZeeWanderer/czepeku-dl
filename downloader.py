@@ -38,7 +38,6 @@ LOG_FILE = "czepeku-dl.log"
 
 listener = None
 _download_lock = RLock()
-progress_lock = RLock()
 shutdown_event = Event()
 thread_local = threading.local()
 position_queue = None
@@ -255,29 +254,27 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
     filename = os.path.basename(path)
 
     progress_bar: tqdm = None
-    with progress_lock:
-        try:
-            progress_bar = tqdm(
-                total=total_size,
-                unit='B',
-                unit_scale=True,
-                desc=filename,
-                leave=False,
-                mininterval=0.5,
-                position=position,
-                dynamic_ncols=True
-            )
-            progress_bar.refresh()
-        except Exception as e:
-            logger.error(f"Failed to create progress bar for {filename}: {e}")
-            return False
+    try:
+        progress_bar = tqdm(
+            total=total_size,
+            unit='B',
+            unit_scale=True,
+            desc=filename,
+            leave=False,
+            mininterval=0.5,
+            position=position,
+            dynamic_ncols=True
+        )
+        progress_bar.refresh()
+    except Exception as e:
+        logger.error(f"Failed to create progress bar for {filename}: {e}")
+        return False
 
     temp_path = path + '.part'
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
     except OSError as e:
-        with progress_lock:
-            progress_bar.close()
+        progress_bar.close()
         logger.error(f"Failed to create directory for {path}: {e}")
         return False
     
@@ -286,9 +283,8 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
     
     initial_downloaded = downloaded
 
-    with progress_lock:
-        progress_bar.n = initial_downloaded
-        progress_bar.refresh()
+    progress_bar.n = initial_downloaded
+    progress_bar.refresh()
 
     while not shutdown_event.is_set() and retry_count < max_retries:
         logger.info(f"Starting download attempt {retry_count + 1}/{max_retries} for {filename}")
@@ -305,10 +301,9 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
 
                 if total_size_in_header is not None and total_size_in_header != total_size:
                     total_size = total_size_in_header
-                    with progress_lock:
-                        logger.debug(f"Setting total_size to {total_size} for {filename}")
-                        progress_bar.total = total_size
-                        progress_bar.refresh()
+                    logger.debug(f"Setting total_size to {total_size} for {filename}")
+                    progress_bar.total = total_size
+                    progress_bar.refresh()
                 
                 with open(temp_path, 'ab') as f:
                     for chunk in r.iter_content(chunk_size=8192):
@@ -317,19 +312,16 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            with progress_lock:
-                                progress_bar.update(len(chunk))
-                                progress_bar.refresh()
+                            progress_bar.update(len(chunk))
+                            progress_bar.refresh()
                             initial_downloaded = max(initial_downloaded, downloaded)
                 
                 if shutdown_event.is_set():
-                    with progress_lock:
-                        progress_bar.close()
+                    progress_bar.close()
                     return False
                     
                 if downloaded >= total_size:
-                    with progress_lock:
-                        progress_bar.close()
+                    progress_bar.close()
                     logger.info(f"Download completed for {filename}")
                     try:
                         os.rename(temp_path, path)
@@ -343,13 +335,11 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
             status_code = e.response.status_code if hasattr(e, 'response') else None
             if status_code == 416:
                 if downloaded == 0:
-                    with progress_lock:
-                        progress_bar.close()
+                    progress_bar.close()
                     logger.error(f"File not available for {filename}: {str(e)[:100]}")
                     return False
                 else:
-                    with progress_lock:
-                        progress_bar.close()
+                    progress_bar.close()
                     logger.info(f"Assuming download complete for {filename} due to 416 error with downloaded {downloaded} bytes")
                     try:
                         os.rename(temp_path, path)
@@ -364,8 +354,7 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
                 time.sleep(delay)
                 headers['Range'] = f'bytes={downloaded}-'
             else:
-                with progress_lock:
-                    progress_bar.close()
+                progress_bar.close()
                 logger.error(f"Download failed for {filename} after {max_retries} retries: {str(e)[:100]}")
                 return False
         except (http.client.IncompleteRead, ChunkedEncodingError, ReadTimeout, RequestException) as e:
@@ -376,8 +365,7 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
                 time.sleep(delay)
                 headers['Range'] = f'bytes={downloaded}-'
             else:
-                with progress_lock:
-                    progress_bar.close()
+                progress_bar.close()
                 logger.error(f"Download failed for {filename} after {max_retries} retries: {str(e)[:100]}")
                 return False
         except Exception as e:
@@ -387,12 +375,10 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
                 delay = min(backoff_factor * (2 ** (retry_count - 1)), max_backoff)
                 time.sleep(delay)
             else:
-                with progress_lock:
-                    progress_bar.close()
+                progress_bar.close()
                 return False
     
-    with progress_lock:
-        progress_bar.close()
+    progress_bar.close()
     return False
 
 def safe_remove(path):
@@ -484,22 +470,20 @@ def extract_archive(file_path, extract_dir, position):
             total_files = len(extractable)
 
             progress_bar = None
-            with progress_lock:
-                progress_bar = tqdm(
-                    total=total_files,
-                    unit=' files',
-                    desc=f"Extracting {filename}",
-                    leave=False,
-                    mininterval=0.5,
-                    position=position,
-                    dynamic_ncols=True
-                )
-                progress_bar.refresh()
+            progress_bar = tqdm(
+                total=total_files,
+                unit=' files',
+                desc=f"Extracting {filename}",
+                leave=False,
+                mininterval=0.5,
+                position=position,
+                dynamic_ncols=True
+            )
+            progress_bar.refresh()
 
             for member in infolist:
                 if shutdown_event.is_set():
-                    with progress_lock:
-                        progress_bar.close()
+                    progress_bar.close()
                     return None
                 if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
                     continue
@@ -525,14 +509,12 @@ def extract_archive(file_path, extract_dir, position):
                         with open(target_path, 'wb') as f:
                             f.write(zf.read(member.filename))
                         logger.debug(f"Extracted {member.filename} to {target_path}")
-                        with progress_lock:
-                            progress_bar.update(1)
-                            progress_bar.refresh()
+                        progress_bar.update(1)
+                        progress_bar.refresh()
                     except Exception as e:
                         logger.error(f"Failed to extract {member.filename}: {e}")
                         continue
-            with progress_lock:
-                progress_bar.close()
+            progress_bar.close()
             logger.debug(f"Extracted all files to {target}")
 
         if not safe_remove(file_path):
@@ -677,9 +659,8 @@ def collect_attachments(executor, users_posts, max_retries, backoff_factor, max_
                                     attachments.append(attachment)
                     except Exception as e:
                         logger.error(f"Error fetching post: {str(e)[:100]}")
-                    with progress_lock:
-                        post_bar.update(1)
-                        post_bar.refresh()
+                    post_bar.update(1)
+                    post_bar.refresh()
                         
                 if shutdown_event.is_set():
                     logger.warning("Cancelling pending fetch tasks")
@@ -868,9 +849,8 @@ def main():
                         except Exception as e:
                             logger.error(f"Attachment processing failed: {str(e)[:100]}")
                             failed_count += 1
-                        with progress_lock:
-                            overall_progress.update(1)
-                            overall_progress.refresh()
+                        overall_progress.update(1)
+                        overall_progress.refresh()
                             
                     if shutdown_event.is_set():
                         logger.warning("Cancelling pending tasks")
