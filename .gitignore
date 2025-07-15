@@ -7,3 +7,4 @@ downloaded_files.csv
 downloaded_files.db
 *.db-shm
 *.db-wal
+*.ps1
