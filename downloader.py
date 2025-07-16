@@ -26,6 +26,7 @@ from queue import Queue
 from threading import Lock, RLock, Event
 from functools import partial
 import sqlite3
+import subprocess
 
 SERVICE = "patreon"
 USERS_POSTS_FILE = "users_posts.json"
@@ -567,7 +568,19 @@ def extract_archive(file_path, extract_dir, position):
         logger.error(f"Extraction failed for {filename}: {str(e)[:100]}")
         return None
 
-def process_attachment(attachment, downloaded_dict, db_file, max_retries, backoff_factor, max_backoff):
+def compress_folder_ntfs_lzx(folder_path):
+    logger = logging.getLogger(f"{__name__}.compress_folder_ntfs_lzx")
+    logger.info(f"Applying NTFS LZX compression to {folder_path}")
+    try:
+        cmd = ['compact', '/c', '/s', '/a', '/i', '/exe:LZX', f'{folder_path}\\*']
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logger.debug(f"Compression command output: {result.stdout}")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Compression failed: {e.stderr}")
+        return False
+
+def process_attachment(attachment, downloaded_dict, db_file, max_retries, backoff_factor, max_backoff, compress):
     logger = logging.getLogger(f"{__name__}.process_attachment")
     logger.info(f"Starting process_attachment for {attachment.get('name')}")
     logger.debug(f"Attachment details: {json.dumps(attachment, indent=2)}")
@@ -608,6 +621,10 @@ def process_attachment(attachment, downloaded_dict, db_file, max_retries, backof
         
         extract_path = extract_archive(local_path, REPOSITORY_DIR, position)
         if extract_path:
+            if compress:
+                compress_success = compress_folder_ntfs_lzx(extract_path)
+                if not compress_success:
+                    logger.warning(f"Compression skipped for {extract_path} due to error")
             with _download_lock:
                 downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
             append_to_downloaded_list(db_file, attachment_path, filename, extract_path)
@@ -704,6 +721,8 @@ def parse_arguments():
                         help="Creators to process (e.g., czepeku czepekuscifi)")
     parser.add_argument('--sets', type=str, nargs='+',
                         help="Sets to process (main animated)")
+    parser.add_argument('--compress', action='store_true',
+                        help="Apply NTFS LZX compression to extracted folders (Windows only)")
     try:
         args = parser.parse_args()
         logger.debug(f"Parsed arguments: {vars(args)}")
@@ -746,6 +765,8 @@ def main():
     logger.info(f"Repository directory: {REPOSITORY_DIR}")
     logger.info(f"Retry settings: max_retries={args.max_retries}, backoff_factor={args.backoff_factor}, max_backoff={args.max_backoff}")
     logger.info(f"Worker threads: {args.workers}")
+    if args.compress:
+        logger.info("NTFS LZX compression enabled for extracted folders")
     
     try:
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -825,7 +846,8 @@ def main():
                     DOWNLOADED_LIST_FILE,
                     args.max_retries,
                     args.backoff_factor,
-                    args.max_backoff
+                    args.max_backoff,
+                    args.compress
                 )
                 futures.append(future)
             except Exception as e:
