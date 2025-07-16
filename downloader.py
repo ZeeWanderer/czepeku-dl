@@ -62,30 +62,63 @@ class DownloadedDB:
         conn.close()
 
     def load(self) -> Dict[str, Dict[str, str]]:
-        conn: sqlite3.Connection = sqlite3.connect(self.db_file)
-        c: sqlite3.Cursor = conn.cursor()
-        c.execute('SELECT attachment_path, zip_name, extract_path, status FROM downloaded')
-        data: Dict[str, Dict[str, str]] = {row[0]: {'zip_name': row[1], 'extract_path': row[2], 'status': row[3]} for row in c}
-        conn.close()
-        return data
+        def retry_op():
+            conn: sqlite3.Connection = sqlite3.connect(self.db_file)
+            c: sqlite3.Cursor = conn.cursor()
+            c.execute('SELECT attachment_path, zip_name, extract_path, status FROM downloaded')
+            data: Dict[str, Dict[str, str]] = {row[0]: {'zip_name': row[1], 'extract_path': row[2], 'status': row[3]} for row in c}
+            conn.close()
+            return data
+
+        return self._with_retry(retry_op)
 
     def claim(self, attachment_path: str, zip_name: str) -> bool:
-        conn: sqlite3.Connection = sqlite3.connect(self.db_file)
-        c: sqlite3.Cursor = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO downloaded (attachment_path, zip_name, extract_path, status) VALUES (?, ?, ?, ?)',
-                  (attachment_path, zip_name, None, 'processing'))
-        conn.commit()
-        inserted: bool = c.rowcount > 0
-        conn.close()
-        return inserted
+        def retry_op():
+            conn: sqlite3.Connection = sqlite3.connect(self.db_file)
+            c: sqlite3.Cursor = conn.cursor()
+            c.execute('INSERT OR IGNORE INTO downloaded (attachment_path, zip_name, extract_path, status) VALUES (?, ?, ?, ?)',
+                      (attachment_path, zip_name, None, 'processing'))
+            conn.commit()
+            inserted: bool = c.rowcount > 0
+            conn.close()
+            return inserted
 
-    def update(self, attachment_path: str, zip_name: str, extract_path: str) -> None:
-        conn: sqlite3.Connection = sqlite3.connect(self.db_file)
-        c: sqlite3.Cursor = conn.cursor()
-        c.execute('UPDATE downloaded SET zip_name = ?, extract_path = ?, status = ? WHERE attachment_path = ?',
-                  (zip_name, extract_path, 'completed', attachment_path))
-        conn.commit()
-        conn.close()
+        return self._with_retry(retry_op)
+
+    def set_completed(self, attachment_path: str, zip_name: str, extract_path: str) -> None:
+        def retry_op():
+            conn: sqlite3.Connection = sqlite3.connect(self.db_file)
+            c: sqlite3.Cursor = conn.cursor()
+            c.execute('UPDATE downloaded SET zip_name = ?, extract_path = ?, status = ? WHERE attachment_path = ?',
+                      (zip_name, extract_path, 'completed', attachment_path))
+            conn.commit()
+            conn.close()
+
+        self._with_retry(retry_op)
+
+    def set_failed(self, attachment_path: str) -> None:
+        def retry_op():
+            conn: sqlite3.Connection = sqlite3.connect(self.db_file)
+            c: sqlite3.Cursor = conn.cursor()
+            c.execute('UPDATE downloaded SET status = ? WHERE attachment_path = ?',
+                      ('failed', attachment_path))
+            conn.commit()
+            conn.close()
+
+        self._with_retry(retry_op)
+
+    def _with_retry(self, func: callable, max_retries: int = 5, delay: float = 0.5) -> Any:
+        for attempt in range(max_retries):
+            try:
+                return func()
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower():
+                    if attempt < max_retries - 1:
+                        time.sleep(delay * (2 ** attempt))
+                    else:
+                        raise
+                else:
+                    raise
 
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     def _adjust_thread_count(self) -> None:
@@ -256,7 +289,7 @@ def fetch_post_data(user_id: str, post_id: str, max_retries: int, backoff_factor
                 logger.error(f"Failed to fetch post {post_id} after {max_retries} attempts: {str(e)[:100]}")
     return None
 
-def download_file(session: requests.Session, url: str, path: str, max_retries: int, backoff_factor: float, max_backoff: int, position: int) -> bool:
+def download_file(session: requests.Session, url: str, path: str, max_retries: int, backoff_factor: float, max_backoff: int, pbar: tqdm) -> bool:
     logger: logging.Logger = logging.getLogger(f"{__name__}.download_file")
     if shutdown_event.is_set():
         return False
@@ -265,28 +298,13 @@ def download_file(session: requests.Session, url: str, path: str, max_retries: i
     retry_count: int = 0
     filename: str = os.path.basename(path)
 
-    progress_bar: Optional[tqdm] = None
-    try:
-        progress_bar = tqdm(
-            total=total_size,
-            unit='B',
-            unit_scale=True,
-            desc=filename,
-            leave=False,
-            mininterval=0.5,
-            position=position,
-            dynamic_ncols=True
-        )
-        progress_bar.refresh()
-    except Exception as e:
-        logger.error(f"Failed to create progress bar for {filename}: {e}")
-        return False
+    pbar.reset()
+    pbar.set_description(f"Downloading {filename}")
 
     temp_path: str = path + '.part'
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
     except OSError as e:
-        progress_bar.close()
         logger.error(f"Failed to create directory for {path}: {e}")
         return False
     
@@ -295,8 +313,10 @@ def download_file(session: requests.Session, url: str, path: str, max_retries: i
     
     initial_downloaded: int = downloaded
 
-    progress_bar.n = initial_downloaded
-    progress_bar.refresh()
+    pbar.unit = 'B'
+    pbar.unit_scale = True
+    pbar.n = initial_downloaded
+    pbar.refresh()
 
     while not shutdown_event.is_set() and retry_count < max_retries:
         logger.info(f"Starting download attempt {retry_count + 1}/{max_retries} for {filename}")
@@ -314,8 +334,8 @@ def download_file(session: requests.Session, url: str, path: str, max_retries: i
                 if total_size_in_header is not None and total_size_in_header != total_size:
                     total_size = total_size_in_header
                     logger.debug(f"Setting total_size to {total_size} for {filename}")
-                    progress_bar.total = total_size
-                    progress_bar.refresh()
+                    pbar.total = total_size
+                    pbar.refresh()
                 
                 with open(temp_path, 'ab') as f:
                     for chunk in r.iter_content(chunk_size=8192):
@@ -324,16 +344,14 @@ def download_file(session: requests.Session, url: str, path: str, max_retries: i
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            progress_bar.update(len(chunk))
-                            progress_bar.refresh()
+                            pbar.update(len(chunk))
+                            pbar.refresh()
                             initial_downloaded = max(initial_downloaded, downloaded)
                 
                 if shutdown_event.is_set():
-                    progress_bar.close()
                     return False
                     
                 if downloaded >= total_size:
-                    progress_bar.close()
                     logger.info(f"Download completed for {filename}")
                     try:
                         os.rename(temp_path, path)
@@ -347,11 +365,9 @@ def download_file(session: requests.Session, url: str, path: str, max_retries: i
             status_code: Optional[int] = e.response.status_code if hasattr(e, 'response') else None
             if status_code == 416:
                 if downloaded == 0:
-                    progress_bar.close()
                     logger.error(f"File not available for {filename}: {str(e)[:100]}")
                     return False
                 else:
-                    progress_bar.close()
                     logger.info(f"Assuming download complete for {filename} due to 416 error with downloaded {downloaded} bytes")
                     try:
                         os.rename(temp_path, path)
@@ -366,7 +382,6 @@ def download_file(session: requests.Session, url: str, path: str, max_retries: i
                 time.sleep(delay)
                 headers['Range'] = f'bytes={downloaded}-'
             else:
-                progress_bar.close()
                 logger.error(f"Download failed for {filename} after {max_retries} retries: {str(e)[:100]}")
                 return False
         except (http.client.IncompleteRead, ChunkedEncodingError, ReadTimeout, RequestException) as e:
@@ -377,7 +392,6 @@ def download_file(session: requests.Session, url: str, path: str, max_retries: i
                 time.sleep(delay)
                 headers['Range'] = f'bytes={downloaded}-'
             else:
-                progress_bar.close()
                 logger.error(f"Download failed for {filename} after {max_retries} retries: {str(e)[:100]}")
                 return False
         except Exception as e:
@@ -387,10 +401,8 @@ def download_file(session: requests.Session, url: str, path: str, max_retries: i
                 delay: float = min(backoff_factor * (2 ** (retry_count - 1)), max_backoff)
                 time.sleep(delay)
             else:
-                progress_bar.close()
                 return False
     
-    progress_bar.close()
     return False
 
 def safe_remove(path: str) -> bool:
@@ -417,7 +429,7 @@ def safe_remove(path: str) -> bool:
             return False
     return False
 
-def extract_archive(file_path: str, extract_dir: str, position: int) -> Optional[str]:
+def extract_archive(file_path: str, extract_dir: str, pbar: tqdm) -> Optional[str]:
     logger: logging.Logger = logging.getLogger(f"{__name__}.extract_archive")
     logger.info(f"Starting extraction of {os.path.basename(file_path)} to {extract_dir}")
     if shutdown_event.is_set():
@@ -481,21 +493,12 @@ def extract_archive(file_path: str, extract_dir: str, position: int) -> Optional
                     extractable.append(member)
             total_files: int = len(extractable)
 
-            progress_bar: Optional[tqdm] = None
-            progress_bar = tqdm(
-                total=total_files,
-                unit=' files',
-                desc=f"Extracting {filename}",
-                leave=False,
-                mininterval=0.5,
-                position=position,
-                dynamic_ncols=True
-            )
-            progress_bar.refresh()
+            pbar.reset(total=total_files)
+            pbar.unit = ' files'
+            pbar.set_description(f"Extracting {filename}")
 
             for member in infolist:
                 if shutdown_event.is_set():
-                    progress_bar.close()
                     return None
                 if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
                     continue
@@ -521,12 +524,11 @@ def extract_archive(file_path: str, extract_dir: str, position: int) -> Optional
                         with open(target_path, 'wb') as f:
                             f.write(zf.read(member.filename))
                         logger.debug(f"Extracted {member.filename} to {target_path}")
-                        progress_bar.update(1)
-                        progress_bar.refresh()
+                        pbar.update(1)
+                        pbar.refresh()
                     except Exception as e:
                         logger.error(f"Failed to extract {member.filename}: {e}")
                         continue
-            progress_bar.close()
             logger.debug(f"Extracted all files to {target}")
 
         if not safe_remove(file_path):
@@ -534,6 +536,10 @@ def extract_archive(file_path: str, extract_dir: str, position: int) -> Optional
         logger.debug(f"Removed original zip file {file_path}")
         
         extract_path: str = target
+
+        pbar.reset(total=None)
+        pbar.unit = ''
+        pbar.set_description(f"Cleaning {filename}")
 
         for root, dirs, files in os.walk(extract_path, topdown=False):
             if shutdown_event.is_set():
@@ -562,7 +568,7 @@ def extract_archive(file_path: str, extract_dir: str, position: int) -> Optional
                 if file.lower().endswith('.zip'):
                     nested_path: str = os.path.join(root, file)
                     logger.debug(f"Found nested zip: {nested_path}")
-                    nested_target: Optional[str] = extract_archive(nested_path, root, position)
+                    nested_target: Optional[str] = extract_archive(nested_path, root, pbar)
                     if nested_target is None:
                         logger.error(f"Failed to extract nested zip {file}")
                         return None
@@ -579,9 +585,12 @@ def extract_archive(file_path: str, extract_dir: str, position: int) -> Optional
         logger.error(f"Extraction failed for {filename}: {str(e)[:100]}")
         return None
 
-def compress_folder_ntfs_lzx(folder_path: str) -> bool:
+def compress_folder_ntfs_lzx(folder_path: str, pbar: tqdm) -> bool:
     logger: logging.Logger = logging.getLogger(f"{__name__}.compress_folder_ntfs_lzx")
     logger.info(f"Applying NTFS LZX compression to {folder_path}")
+    pbar.reset(total=None)
+    pbar.unit = ''
+    pbar.set_description(f"Compressing {os.path.basename(folder_path)}")
     try:
         cmd: List[str] = ['compact', '/c', '/s', '/a', '/i', '/exe:LZX', f'{folder_path}\\*']
         result: subprocess.CompletedProcess = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -606,12 +615,26 @@ def process_attachment(attachment: Dict[str, Any], downloaded_dict: Dict[str, Di
             logger.info(f"Skipping already downloaded {filename}")
             return False
     
-    if attachment_path not in downloaded_dict:
-        inserted: bool = db.claim(attachment_path, filename)
+    position: int = position_queue.get()
     
+    if shutdown_event.is_set():
+        position_queue.put(position)
+        return False
+    
+    pbar: tqdm = tqdm(total=None, unit='', desc=f"Processing {filename}", position=position, leave=False, dynamic_ncols=True)
+    pbar.refresh()
+    
+    if attachment_path not in downloaded_dict:
+        pbar.set_description(f"Claiming {filename}")
+        pbar.refresh()
+        inserted: bool = db.claim(attachment_path, filename)
+        
         if not inserted:
             logger.info(f"Skipping {filename} (already claimed by another thread)")
+            pbar.close()
+            position_queue.put(position)
             return False
+    # Else, it's 'processing', proceed to resume
         
     session: requests.Session = thread_local.session
     
@@ -619,16 +642,11 @@ def process_attachment(attachment: Dict[str, Any], downloaded_dict: Dict[str, Di
     file_url: str = f"{server}/data{attachment_path}"
     local_path: str = os.path.join(DOWNLOAD_DIR, filename)
     
-    position: int = position_queue.get()
-    
-    if shutdown_event.is_set():
-        position_queue.put(position)
-        return False
 
     outer_retry: int = 0
     max_outer_retries: int = 3
     while outer_retry < max_outer_retries and not shutdown_event.is_set():
-        success: bool = download_file(session, file_url, local_path, max_retries, backoff_factor, max_backoff, position)
+        success: bool = download_file(session, file_url, local_path, max_retries, backoff_factor, max_backoff, pbar)
         
         if not success:
             outer_retry += 1
@@ -637,17 +655,20 @@ def process_attachment(attachment: Dict[str, Any], downloaded_dict: Dict[str, Di
                 time.sleep(delay)
             continue
         
-        extract_path: Optional[str] = extract_archive(local_path, REPOSITORY_DIR, position)
+        extract_path: Optional[str] = extract_archive(local_path, REPOSITORY_DIR, pbar)
         if extract_path:
             relative_extract_path: str = os.path.relpath(extract_path, REPOSITORY_DIR)
             if compress:
-                compress_success: bool = compress_folder_ntfs_lzx(extract_path)
+                compress_success: bool = compress_folder_ntfs_lzx(extract_path, pbar)
                 if not compress_success:
-                    logger.warning(f"Compression skipped for {relative_extract_path} due to error")
+                    logger.warning(f"Compression skipped for {extract_path} due to error")
             with _download_lock:
                 downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': relative_extract_path, 'status': 'completed'}
-            db.update(attachment_path, filename, relative_extract_path)
+            pbar.set_description(f"Updating DB for {filename}")
+            pbar.refresh()
+            db.set_completed(attachment_path, filename, relative_extract_path)
             logger.info(f"Successfully processed {filename}")
+            pbar.close()
             position_queue.put(position)
             return True
         else:
@@ -658,6 +679,12 @@ def process_attachment(attachment: Dict[str, Any], downloaded_dict: Dict[str, Di
                 delay: float = min(backoff_factor * (2 ** (outer_retry - 1)), max_backoff)
                 time.sleep(delay)
 
+    if os.path.exists(local_path):
+        safe_remove(local_path)
+    pbar.set_description(f"Marking as failed {filename}")
+    pbar.refresh()
+    db.set_failed(attachment_path)
+    pbar.close()
     position_queue.put(position)
     return False
 
