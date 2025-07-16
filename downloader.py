@@ -3,7 +3,6 @@ import sys
 import json
 import zipfile
 import shutil
-import pickle
 import re
 import requests
 import logging
@@ -27,35 +26,80 @@ from threading import Lock, RLock, Event
 from functools import partial
 import sqlite3
 import subprocess
+from typing import Any, Dict, List, Optional, Union, Tuple
 
-SERVICE = "patreon"
-USERS_POSTS_FILE = "users_posts.json"
-COOKIE_FILE = "cookies.txt"
-DOWNLOADED_LIST_FILE = "downloaded_files.db"
-DOWNLOAD_DIR = "downloads"
-REPOSITORY_DIR = "maps_repository"
-LOG_DIR = "logs"
-LOG_FILE = "czepeku-dl.log"
+SERVICE: str = "patreon"
+USERS_POSTS_FILE: str = "users_posts.json"
+COOKIE_FILE: str = "cookies.txt"
+DOWNLOADED_LIST_FILE: str = "downloaded_files.db"
+DOWNLOAD_DIR: str = "downloads"
+REPOSITORY_DIR: str = "maps_repository"
+LOG_DIR: str = "logs"
+LOG_FILE: str = "czepeku-dl.log"
 
-listener = None
-_download_lock = RLock()
-shutdown_event = Event()
-thread_local = threading.local()
-position_queue = None
+listener: Optional[QueueListener] = None
+_download_lock: RLock = RLock()
+shutdown_event: Event = Event()
+thread_local: threading.local = threading.local()
+position_queue: Optional[Queue] = None
+
+class DownloadedDB:
+    def __init__(self, db_file: str) -> None:
+        self.db_file: str = db_file
+        self.init_db()
+
+    def init_db(self) -> None:
+        conn: sqlite3.Connection = sqlite3.connect(self.db_file)
+        c: sqlite3.Cursor = conn.cursor()
+        c.execute('PRAGMA journal_mode=WAL')
+        c.execute('''CREATE TABLE IF NOT EXISTS downloaded 
+                     (attachment_path TEXT PRIMARY KEY, zip_name TEXT, extract_path TEXT, status TEXT)''')
+        c.execute("PRAGMA table_info(downloaded)")
+        columns = [row[1] for row in c.fetchall()]
+        if 'status' not in columns:
+            c.execute("ALTER TABLE downloaded ADD COLUMN status TEXT")
+        conn.commit()
+        conn.close()
+
+    def load(self) -> Dict[str, Dict[str, str]]:
+        conn: sqlite3.Connection = sqlite3.connect(self.db_file)
+        c: sqlite3.Cursor = conn.cursor()
+        c.execute('SELECT attachment_path, zip_name, extract_path, status FROM downloaded')
+        data: Dict[str, Dict[str, str]] = {row[0]: {'zip_name': row[1], 'extract_path': row[2], 'status': row[3]} for row in c}
+        conn.close()
+        return data
+
+    def claim(self, attachment_path: str, zip_name: str) -> bool:
+        conn: sqlite3.Connection = sqlite3.connect(self.db_file)
+        c: sqlite3.Cursor = conn.cursor()
+        c.execute('INSERT OR IGNORE INTO downloaded (attachment_path, zip_name, extract_path, status) VALUES (?, ?, ?, ?)',
+                  (attachment_path, zip_name, None, 'processing'))
+        conn.commit()
+        inserted: bool = c.rowcount > 0
+        conn.close()
+        return inserted
+
+    def update(self, attachment_path: str, zip_name: str, extract_path: str) -> None:
+        conn: sqlite3.Connection = sqlite3.connect(self.db_file)
+        c: sqlite3.Cursor = conn.cursor()
+        c.execute('UPDATE downloaded SET zip_name = ?, extract_path = ?, status = ? WHERE attachment_path = ?',
+                  (zip_name, extract_path, 'completed', attachment_path))
+        conn.commit()
+        conn.close()
 
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    def _adjust_thread_count(self):
+    def _adjust_thread_count(self) -> None:
         if self._idle_semaphore.acquire(timeout=0):
             return
 
-        def weakref_cb(_, q=self._work_queue):
+        def weakref_cb(_, q: Queue = self._work_queue) -> None:
             q.put(None)
 
-        num_threads = len(self._threads)
+        num_threads: int = len(self._threads)
         if num_threads < self._max_workers:
-            thread_name = '%s_%d' % (self._thread_name_prefix or self,
+            thread_name: str = '%s_%d' % (self._thread_name_prefix or self,
                                      num_threads)
-            t = threading.Thread(name=thread_name, target=_thread._worker,
+            t: threading.Thread = threading.Thread(name=thread_name, target=_thread._worker,
                                  args=(weakref.ref(self, weakref_cb),
                                        self._work_queue,
                                        self._initializer,
@@ -66,20 +110,20 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
             _thread._threads_queues[t] = self._work_queue
 
 class TqdmHandler(logging.StreamHandler):
-    def emit(self, record):
+    def emit(self, record: logging.LogRecord) -> None:
         try:
-            msg = self.format(record)
+            msg: str = self.format(record)
             tqdm.write(msg)
             self.flush()
         except Exception:
             self.handleError(record)
 
-def setup_logging(log_level, progress_only):
+def setup_logging(log_level: str, progress_only: bool) -> None:
     global listener
     os.makedirs(LOG_DIR, exist_ok=True)
-    log_queue = Queue(-1)
+    log_queue: Queue = Queue(-1)
     
-    console_formatter = ColoredFormatter(
+    console_formatter: ColoredFormatter = ColoredFormatter(
         "%(log_color)s%(asctime)s - %(levelname)s - %(message)s",
         reset=True,
         log_colors={
@@ -90,15 +134,15 @@ def setup_logging(log_level, progress_only):
             'CRITICAL': 'bold_red',
         }
     )
-    console_handler = TqdmHandler()
+    console_handler: TqdmHandler = TqdmHandler()
     console_handler.setLevel(log_level)
     console_handler.setFormatter(console_formatter)
 
-    file_formatter = logging.Formatter(
+    file_formatter: logging.Formatter = logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s'
     )
-    log_path = os.path.join(LOG_DIR, LOG_FILE)
-    file_handler = RotatingFileHandler(
+    log_path: str = os.path.join(LOG_DIR, LOG_FILE)
+    file_handler: RotatingFileHandler = RotatingFileHandler(
         filename=log_path,
         maxBytes=5 * 1024 * 1024,
         backupCount=5
@@ -113,8 +157,8 @@ def setup_logging(log_level, progress_only):
     listener.daemon = True
     listener.start()
 
-    queue_handler = QueueHandler(log_queue)
-    root_logger = logging.getLogger()
+    queue_handler: QueueHandler = QueueHandler(log_queue)
+    root_logger: logging.Logger = logging.getLogger()
     root_logger.setLevel(log_level)
     root_logger.handlers.clear()
     root_logger.addHandler(queue_handler)
@@ -125,46 +169,46 @@ def setup_logging(log_level, progress_only):
         except Exception as e:
             root_logger.error(f"Failed to rollover log file: {e}")
 
-def load_config_file(filename):
-    logger = logging.getLogger(f"{__name__}.load_config_file")
+def load_config_file(filename: str) -> Optional[str]:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.load_config_file")
     if not os.path.exists(filename):
         logger.critical(f"Config file {filename} not found")
         return None
     try:
         with open(filename, 'r') as f:
-            content = f.read()
+            content: str = f.read()
         content = re.sub(r'//.*|/\*[\s\S]*?\*/', '', content)
         return content
     except Exception as e:
         logger.critical(f"Failed to read config file {filename}: {e}")
         return None
 
-def load_users_posts():
-    logger = logging.getLogger(f"{__name__}.load_users_posts")
+def load_users_posts() -> Dict[str, Any]:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.load_users_posts")
     logger.info("Loading users and posts configuration")
-    content = load_config_file(USERS_POSTS_FILE)
+    content: Optional[str] = load_config_file(USERS_POSTS_FILE)
     if content is None:
         sys.exit(1)
     try:
-        data = json.loads(content)
+        data: Dict[str, Any] = json.loads(content)
         logger.debug(f"Loaded users_posts data: {json.dumps(data, indent=2)}")
         return data
     except json.JSONDecodeError as e:
         logger.critical(f"Invalid JSON in {USERS_POSTS_FILE}: {e}")
         sys.exit(1)
 
-def load_cookies(cookie_file):
-    logger = logging.getLogger(f"{__name__}.load_cookies")
+def load_cookies(cookie_file: str) -> Optional[MozillaCookieJar]:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.load_cookies")
     logger.info(f"Loading cookies from {cookie_file}")
-    jar = None
-    expired_count = 0
+    jar: Optional[MozillaCookieJar] = None
+    expired_count: int = 0
     
     if os.path.exists(cookie_file):
         try:
             jar = MozillaCookieJar(cookie_file)
             jar.load(ignore_discard=True, ignore_expires=True)
             
-            current_time = time.time()
+            current_time: float = time.time()
             for cookie in list(jar):
                 if cookie.expires and cookie.expires < current_time:
                     expired_count += 1
@@ -181,56 +225,23 @@ def load_cookies(cookie_file):
     
     return jar
 
-def init_downloaded_db(db_file):
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    c.execute('PRAGMA journal_mode=WAL')
-    c.execute('''CREATE TABLE IF NOT EXISTS downloaded 
-                 (attachment_path TEXT PRIMARY KEY, zip_name TEXT, extract_path TEXT)''')
-    conn.commit()
-    conn.close()
-
-def load_downloaded_list(db_file):
-    logger = logging.getLogger(f"{__name__}.load_downloaded_list")
-    logger.info("Loading previously downloaded files list")
-    init_downloaded_db(db_file)
-    downloaded_dict = {}
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    c.execute('SELECT attachment_path, zip_name, extract_path FROM downloaded')
-    for row in c:
-        downloaded_dict[row[0]] = {'zip_name': row[1], 'extract_path': row[2]}
-    conn.close()
-    logger.debug(f"Loaded downloaded dict with {len(downloaded_dict)} entries")
-    return downloaded_dict
-
-def append_to_downloaded_list(db_file, attachment_path, zip_name, extract_path):
-    logger = logging.getLogger(f"{__name__}.append_to_downloaded_list")
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO downloaded (attachment_path, zip_name, extract_path) VALUES (?, ?, ?)',
-              (attachment_path, zip_name, extract_path))
-    conn.commit()
-    conn.close()
-    logger.debug(f"Appended {attachment_path} to downloaded list")
-
-def fetch_post_data(user_id, post_id, max_retries, backoff_factor, max_backoff):
-    session = thread_local.session
-    logger = logging.getLogger(f"{__name__}.fetch_post_data")
+def fetch_post_data(user_id: str, post_id: str, max_retries: int, backoff_factor: float, max_backoff: int) -> Optional[Dict[str, Any]]:
+    session: requests.Session = thread_local.session
+    logger: logging.Logger = logging.getLogger(f"{__name__}.fetch_post_data")
     logger.info(f"Fetching post {post_id} for user {user_id}")
     if shutdown_event.is_set():
         return None
         
-    url = f"https://kemono.su/api/v1/{SERVICE}/user/{user_id}/post/{post_id}"
+    url: str = f"https://kemono.su/api/v1/{SERVICE}/user/{user_id}/post/{post_id}"
     
-    attempt = 0
+    attempt: int = 0
     
     while attempt < max_retries and not shutdown_event.is_set():
         attempt += 1
         try:
-            response = session.get(url, timeout=15)
+            response: requests.Response = session.get(url, timeout=15)
             response.raise_for_status()
-            data = response.json()
+            data: Dict[str, Any] = response.json()
             logger.debug(f"Fetched post data for {post_id}: {json.dumps(data, indent=2)}")
             return data
         except RequestException as e:
@@ -238,23 +249,23 @@ def fetch_post_data(user_id, post_id, max_retries, backoff_factor, max_backoff):
                 return None
                 
             if attempt < max_retries:
-                delay = min(backoff_factor * (2 ** (attempt - 1)), max_backoff)
+                delay: float = min(backoff_factor * (2 ** (attempt - 1)), max_backoff)
                 logger.debug(f"Retrying post {post_id} in {delay:.1f}s: {str(e)[:100]}")
                 time.sleep(delay)
             else:
                 logger.error(f"Failed to fetch post {post_id} after {max_retries} attempts: {str(e)[:100]}")
     return None
 
-def download_file(session, url, path, max_retries, backoff_factor, max_backoff, position):
-    logger = logging.getLogger(f"{__name__}.download_file")
+def download_file(session: requests.Session, url: str, path: str, max_retries: int, backoff_factor: float, max_backoff: int, position: int) -> bool:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.download_file")
     if shutdown_event.is_set():
         return False
     
-    total_size = None
-    retry_count = 0
-    filename = os.path.basename(path)
+    total_size: Optional[int] = None
+    retry_count: int = 0
+    filename: str = os.path.basename(path)
 
-    progress_bar: tqdm = None
+    progress_bar: Optional[tqdm] = None
     try:
         progress_bar = tqdm(
             total=total_size,
@@ -271,7 +282,7 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
         logger.error(f"Failed to create progress bar for {filename}: {e}")
         return False
 
-    temp_path = path + '.part'
+    temp_path: str = path + '.part'
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
     except OSError as e:
@@ -279,10 +290,10 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
         logger.error(f"Failed to create directory for {path}: {e}")
         return False
     
-    downloaded = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
-    headers = {'Range': f'bytes={downloaded}-'} if downloaded else {}
+    downloaded: int = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+    headers: Dict[str, str] = {'Range': f'bytes={downloaded}-'} if downloaded else {}
     
-    initial_downloaded = downloaded
+    initial_downloaded: int = downloaded
 
     progress_bar.n = initial_downloaded
     progress_bar.refresh()
@@ -294,7 +305,7 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
             with session.get(url, stream=True, headers=headers, timeout=(10, 5)) as r:
                 r.raise_for_status()
                 
-                total_size_in_header = None
+                total_size_in_header: Optional[int] = None
                 if 'content-range' in r.headers:
                     total_size_in_header = int(r.headers['content-range'].split('/')[-1])
                 else:
@@ -333,7 +344,7 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
                 headers['Range'] = f'bytes={downloaded}-'
 
         except HTTPError as e:
-            status_code = e.response.status_code if hasattr(e, 'response') else None
+            status_code: Optional[int] = e.response.status_code if hasattr(e, 'response') else None
             if status_code == 416:
                 if downloaded == 0:
                     progress_bar.close()
@@ -350,7 +361,7 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
                     return True
             retry_count += 1
             if retry_count < max_retries and not shutdown_event.is_set():
-                delay = min(backoff_factor * (2 ** (retry_count - 1)), max_backoff)
+                delay: float = min(backoff_factor * (2 ** (retry_count - 1)), max_backoff)
                 logger.debug(f"Download retry {retry_count}/{max_retries} for {filename}: {str(e)[:100]}, waiting {delay:.1f}s")
                 time.sleep(delay)
                 headers['Range'] = f'bytes={downloaded}-'
@@ -361,7 +372,7 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
         except (http.client.IncompleteRead, ChunkedEncodingError, ReadTimeout, RequestException) as e:
             retry_count += 1
             if retry_count < max_retries and not shutdown_event.is_set():
-                delay = min(backoff_factor * (2 ** (retry_count - 1)), max_backoff)
+                delay: float = min(backoff_factor * (2 ** (retry_count - 1)), max_backoff)
                 logger.debug(f"Download retry {retry_count}/{max_retries} for {filename}: {str(e)[:100]}, waiting {delay:.1f}s")
                 time.sleep(delay)
                 headers['Range'] = f'bytes={downloaded}-'
@@ -373,7 +384,7 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
             logger.error(f"Unexpected error during download of {filename}: {e}")
             retry_count += 1
             if retry_count < max_retries and not shutdown_event.is_set():
-                delay = min(backoff_factor * (2 ** (retry_count - 1)), max_backoff)
+                delay: float = min(backoff_factor * (2 ** (retry_count - 1)), max_backoff)
                 time.sleep(delay)
             else:
                 progress_bar.close()
@@ -382,9 +393,9 @@ def download_file(session, url, path, max_retries, backoff_factor, max_backoff, 
     progress_bar.close()
     return False
 
-def safe_remove(path):
-    logger = logging.getLogger(f"{__name__}.safe_remove")
-    max_attempts = 5
+def safe_remove(path: str) -> bool:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.safe_remove")
+    max_attempts: int = 5
     for attempt in range(max_attempts):
         try:
             os.remove(path)
@@ -392,7 +403,7 @@ def safe_remove(path):
             return True
         except PermissionError as e:
             if attempt < max_attempts - 1:
-                delay = 0.2 * (2 ** attempt)
+                delay: float = 0.2 * (2 ** attempt)
                 logger.debug(f"PermissionError removing {path}: {str(e)[:100]}. Retrying in {delay:.1f}s")
                 time.sleep(delay)
             else:
@@ -406,8 +417,8 @@ def safe_remove(path):
             return False
     return False
 
-def extract_archive(file_path, extract_dir, position):
-    logger = logging.getLogger(f"{__name__}.extract_archive")
+def extract_archive(file_path: str, extract_dir: str, position: int) -> Optional[str]:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.extract_archive")
     logger.info(f"Starting extraction of {os.path.basename(file_path)} to {extract_dir}")
     if shutdown_event.is_set():
         logger.debug("Shutdown event set, aborting extraction")
@@ -418,28 +429,28 @@ def extract_archive(file_path, extract_dir, position):
         return None
 
     try:
-        filename = os.path.basename(file_path)
+        filename: str = os.path.basename(file_path)
         with zipfile.ZipFile(file_path) as zf:
             logger.debug(f"Opened zip file {filename}")
-            infolist = zf.infolist()
+            infolist: List[zipfile.ZipInfo] = zf.infolist()
             logger.debug(f"Zip contents: {[m.filename for m in infolist]}")
             logger.debug("Zip structure:")
-            all_paths = sorted([m.filename for m in infolist])
+            all_paths: List[str] = sorted([m.filename for m in infolist])
             for path in all_paths:
-                parts = path.split('/')
-                indent = '  ' * (len(parts) - 1)
-                name = parts[-1]
+                parts: List[str] = path.split('/')
+                indent: str = '  ' * (len(parts) - 1)
+                name: str = parts[-1]
                 if not name and len(parts) > 1:
                     indent = '  ' * (len(parts) - 2)
                     name = parts[-2] + '/'
                 logger.debug(f"{indent}- {name}")
-            junk_prefixes = ('__MACOSX', '.DS_Store')
-            supplement_names = ('Gridded', 'Gridless', 'Supplement')
-            top_dirs = set()
-            has_supplements = False
+            junk_prefixes: Tuple[str, str] = ('__MACOSX', '.DS_Store')
+            supplement_names: Tuple[str, str, str] = ('Gridded', 'Gridless', 'Supplement')
+            top_dirs: set[str] = set()
+            has_supplements: bool = False
             for m in infolist:
                 if '/' in m.filename:
-                    top = m.filename.split('/')[0]
+                    top: str = m.filename.split('/')[0]
                     if any(top.startswith(j) for j in junk_prefixes):
                         continue
                     if any(top.startswith(s) for s in supplement_names):
@@ -450,9 +461,9 @@ def extract_archive(file_path, extract_dir, position):
             logger.debug(f"Has supplements: {has_supplements}")
             
             if len(top_dirs) == 1 and not has_supplements and list(top_dirs)[0]:
-                target = extract_dir
+                target: str = extract_dir
             else:
-                base_name = os.path.splitext(filename)[0]
+                base_name: str = os.path.splitext(filename)[0]
                 target = os.path.join(extract_dir, base_name)
             
             logger.debug(f"Determined target directory: {target}")
@@ -462,15 +473,15 @@ def extract_archive(file_path, extract_dir, position):
                 logger.error(f"Failed to create target directory {target}: {e}")
                 return None
 
-            extractable = []
+            extractable: List[zipfile.ZipInfo] = []
             for member in infolist:
                 if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
                     continue
                 if not member.is_dir():
                     extractable.append(member)
-            total_files = len(extractable)
+            total_files: int = len(extractable)
 
-            progress_bar = None
+            progress_bar: Optional[tqdm] = None
             progress_bar = tqdm(
                 total=total_files,
                 unit=' files',
@@ -488,8 +499,8 @@ def extract_archive(file_path, extract_dir, position):
                     return None
                 if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
                     continue
-                target_path = os.path.join(target, member.filename)
-                target_dir = os.path.dirname(target_path)
+                target_path: str = os.path.join(target, member.filename)
+                target_dir: str = os.path.dirname(target_path)
                 try:
                     os.makedirs(target_dir, exist_ok=True)
                 except OSError as e:
@@ -522,7 +533,7 @@ def extract_archive(file_path, extract_dir, position):
             return None
         logger.debug(f"Removed original zip file {file_path}")
         
-        extract_path = target
+        extract_path: str = target
 
         for root, dirs, files in os.walk(extract_path, topdown=False):
             if shutdown_event.is_set():
@@ -530,7 +541,7 @@ def extract_archive(file_path, extract_dir, position):
                 return None
             logger.debug(f"Cleaning directory: {root}")
             if '__MACOSX' in dirs:
-                path = os.path.join(root, '__MACOSX')
+                path: str = os.path.join(root, '__MACOSX')
                 try:
                     shutil.rmtree(path, ignore_errors=True)
                 except Exception as e:
@@ -549,9 +560,9 @@ def extract_archive(file_path, extract_dir, position):
             logger.debug(f"Checking for nested zips in {root}")
             for file in files:
                 if file.lower().endswith('.zip'):
-                    nested_path = os.path.join(root, file)
+                    nested_path: str = os.path.join(root, file)
                     logger.debug(f"Found nested zip: {nested_path}")
-                    nested_target = extract_archive(nested_path, root, position)
+                    nested_target: Optional[str] = extract_archive(nested_path, root, position)
                     if nested_target is None:
                         logger.error(f"Failed to extract nested zip {file}")
                         return None
@@ -568,66 +579,74 @@ def extract_archive(file_path, extract_dir, position):
         logger.error(f"Extraction failed for {filename}: {str(e)[:100]}")
         return None
 
-def compress_folder_ntfs_lzx(folder_path):
-    logger = logging.getLogger(f"{__name__}.compress_folder_ntfs_lzx")
+def compress_folder_ntfs_lzx(folder_path: str) -> bool:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.compress_folder_ntfs_lzx")
     logger.info(f"Applying NTFS LZX compression to {folder_path}")
     try:
-        cmd = ['compact', '/c', '/s', '/a', '/i', '/exe:LZX', f'{folder_path}\\*']
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        cmd: List[str] = ['compact', '/c', '/s', '/a', '/i', '/exe:LZX', f'{folder_path}\\*']
+        result: subprocess.CompletedProcess = subprocess.run(cmd, capture_output=True, text=True, check=True)
         logger.debug(f"Compression command output: {result.stdout}")
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"Compression failed: {e.stderr}")
         return False
 
-def process_attachment(attachment, downloaded_dict, db_file, max_retries, backoff_factor, max_backoff, compress):
-    logger = logging.getLogger(f"{__name__}.process_attachment")
+def process_attachment(attachment: Dict[str, Any], downloaded_dict: Dict[str, Dict[str, str]], db: DownloadedDB, max_retries: int, backoff_factor: float, max_backoff: int, compress: bool) -> bool:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.process_attachment")
     logger.info(f"Starting process_attachment for {attachment.get('name')}")
     logger.debug(f"Attachment details: {json.dumps(attachment, indent=2)}")
     if shutdown_event.is_set():
         return False
         
-    filename = attachment.get('name')
-    attachment_path = attachment['path']
+    filename: Optional[str] = attachment.get('name')
+    attachment_path: str = attachment['path']
     
     with _download_lock:
-        if attachment_path in downloaded_dict:
+        if attachment_path in downloaded_dict and downloaded_dict[attachment_path]['status'] == 'completed':
             logger.info(f"Skipping already downloaded {filename}")
             return False
     
-    session = thread_local.session
+    if attachment_path not in downloaded_dict:
+        inserted: bool = db.claim(attachment_path, filename)
     
-    server = attachment.get('server', 'https://kemono.su')
-    file_url = f"{server}/data{attachment_path}"
-    local_path = os.path.join(DOWNLOAD_DIR, filename)
+        if not inserted:
+            logger.info(f"Skipping {filename} (already claimed by another thread)")
+            return False
+        
+    session: requests.Session = thread_local.session
     
-    position = position_queue.get()
+    server: str = attachment.get('server', 'https://kemono.su')
+    file_url: str = f"{server}/data{attachment_path}"
+    local_path: str = os.path.join(DOWNLOAD_DIR, filename)
+    
+    position: int = position_queue.get()
     
     if shutdown_event.is_set():
         position_queue.put(position)
         return False
 
-    outer_retry = 0
-    max_outer_retries = 3
+    outer_retry: int = 0
+    max_outer_retries: int = 3
     while outer_retry < max_outer_retries and not shutdown_event.is_set():
-        success = download_file(session, file_url, local_path, max_retries, backoff_factor, max_backoff, position)
+        success: bool = download_file(session, file_url, local_path, max_retries, backoff_factor, max_backoff, position)
         
         if not success:
             outer_retry += 1
             if outer_retry < max_outer_retries:
-                delay = min(backoff_factor * (2 ** (outer_retry - 1)), max_backoff)
+                delay: float = min(backoff_factor * (2 ** (outer_retry - 1)), max_backoff)
                 time.sleep(delay)
             continue
         
-        extract_path = extract_archive(local_path, REPOSITORY_DIR, position)
+        extract_path: Optional[str] = extract_archive(local_path, REPOSITORY_DIR, position)
         if extract_path:
+            relative_extract_path: str = os.path.relpath(extract_path, REPOSITORY_DIR)
             if compress:
-                compress_success = compress_folder_ntfs_lzx(extract_path)
+                compress_success: bool = compress_folder_ntfs_lzx(extract_path)
                 if not compress_success:
-                    logger.warning(f"Compression skipped for {extract_path} due to error")
+                    logger.warning(f"Compression skipped for {relative_extract_path} due to error")
             with _download_lock:
-                downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': extract_path}
-            append_to_downloaded_list(db_file, attachment_path, filename, extract_path)
+                downloaded_dict[attachment_path] = {'zip_name': filename, 'extract_path': relative_extract_path, 'status': 'completed'}
+            db.update(attachment_path, filename, relative_extract_path)
             logger.info(f"Successfully processed {filename}")
             position_queue.put(position)
             return True
@@ -636,31 +655,32 @@ def process_attachment(attachment, downloaded_dict, db_file, max_retries, backof
             safe_remove(local_path)
             outer_retry += 1
             if outer_retry < max_outer_retries:
-                delay = min(backoff_factor * (2 ** (outer_retry - 1)), max_backoff)
+                delay: float = min(backoff_factor * (2 ** (outer_retry - 1)), max_backoff)
                 time.sleep(delay)
 
     position_queue.put(position)
     return False
 
-def collect_attachments(executor, users_posts, max_retries, backoff_factor, max_backoff):
-    logger = logging.getLogger(f"{__name__}.collect_attachments")
+def collect_attachments(executor: ThreadPoolExecutor, users_posts: Dict[str, List[str]], max_retries: int, backoff_factor: float, max_backoff: int) -> List[Dict[str, Any]]:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.collect_attachments")
     logger.info("Starting to collect attachments")
     if shutdown_event.is_set():
         return []
         
-    post_tasks = [(user_id, post_id) for user_id, post_ids in users_posts.items() for post_id in post_ids]
-    post_count = len(post_tasks)
+    post_tasks: List[Tuple[str, str]] = [(user_id, post_id) for user_id, post_ids in users_posts.items() for post_id in post_ids]
+    post_count: int = len(post_tasks)
     
-    attachments = []
-    fetch_futures = []
+    attachments: List[Dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    fetch_futures: List[_base.Future] = []
     for user_id, post_id in post_tasks:
         try:
-            future = executor.submit(fetch_post_data, user_id, post_id, max_retries, backoff_factor, max_backoff)
+            future: _base.Future = executor.submit(fetch_post_data, user_id, post_id, max_retries, backoff_factor, max_backoff)
             fetch_futures.append(future)
         except Exception as e:
             logger.error(f"Failed to submit fetch task for post {post_id}: {e}")
     
-    not_done = set(fetch_futures)
+    not_done: set[_base.Future] = set(fetch_futures)
     
     try:
         with tqdm(total=post_count, desc="Fetching posts", leave=True, position=0) as post_bar:
@@ -668,12 +688,15 @@ def collect_attachments(executor, users_posts, max_retries, backoff_factor, max_
                 done, not_done = wait(not_done, timeout=0.5, return_when=FIRST_COMPLETED)
                 for future in done:
                     try:
-                        post_data = future.result()
+                        post_data: Optional[Dict[str, Any]] = future.result()
                         if post_data:
                             for attachment in post_data.get('attachments', []):
                                 if attachment.get('name', '').lower().endswith('.zip'):
-                                    logger.debug(f"Found ZIP attachment: {attachment.get('name')}, path: {attachment['path']}")
-                                    attachments.append(attachment)
+                                    if attachment['path'] not in seen_paths:
+                                        seen_paths.add(attachment['path'])
+                                        attachments.append(attachment)
+                                    else:
+                                        logger.debug(f"Skipping duplicate attachment path: {attachment['path']}")
                     except Exception as e:
                         logger.error(f"Error fetching post: {str(e)[:100]}")
                     post_bar.update(1)
@@ -690,9 +713,9 @@ def collect_attachments(executor, users_posts, max_retries, backoff_factor, max_
     logger.debug(f"Attachment list: {[att.get('name') for att in attachments]}")
     return attachments
 
-def parse_arguments():
-    logger = logging.getLogger(f"{__name__}.parse_arguments")
-    parser = argparse.ArgumentParser(
+def parse_arguments() -> argparse.Namespace:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.parse_arguments")
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description="Download and extract Czepeku maps from Patreon via Kemono.su",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -724,19 +747,19 @@ def parse_arguments():
     parser.add_argument('--compress', action='store_true',
                         help="Apply NTFS LZX compression to extracted folders (Windows only)")
     try:
-        args = parser.parse_args()
+        args: argparse.Namespace = parser.parse_args()
         logger.debug(f"Parsed arguments: {vars(args)}")
         return args
     except SystemExit:
         logger.critical("Argument parsing failed")
         sys.exit(1)
 
-def signal_handler(signum, frame):
-    logger = logging.getLogger(f"{__name__}.signal_handler")
+def signal_handler(signum: int, frame: Any) -> None:
+    logger: logging.Logger = logging.getLogger(f"{__name__}.signal_handler")
     logger.warning(f"Received signal {signum}, initiating shutdown...")
     shutdown_event.set()
 
-def init_worker(jar):
+def init_worker(jar: Optional[MozillaCookieJar]) -> None:
     try:
         thread_local.session = requests.Session()
         if jar is not None:
@@ -744,11 +767,11 @@ def init_worker(jar):
     except Exception as e:
         logging.getLogger(f"{__name__}.init_worker").error(f"Failed to initialize session: {e}")
 
-def main():
-    args = parse_arguments()
+def main() -> None:
+    args: argparse.Namespace = parse_arguments()
     setup_logging(args.log_level, args.progress_only)
     
-    logger = logging.getLogger(f"{__name__}.main")
+    logger: logging.Logger = logging.getLogger(f"{__name__}.main")
     logger.info("Starting Czepeku downloader")
     
     global USERS_POSTS_FILE, COOKIE_FILE, DOWNLOAD_DIR, REPOSITORY_DIR, position_queue, DOWNLOADED_LIST_FILE
@@ -775,28 +798,29 @@ def main():
         logger.critical(f"Failed to create directories: {e}")
         sys.exit(1)
     
-    jar = load_cookies(COOKIE_FILE)
+    jar: Optional[MozillaCookieJar] = load_cookies(COOKIE_FILE)
     
-    users_posts_raw = load_users_posts()
+    users_posts_raw: Dict[str, Any] = load_users_posts()
     
     if args.creators:
         users_posts_raw = {k: v for k, v in users_posts_raw.items() if k in args.creators}
     
-    users_posts = {}
+    users_posts: Dict[str, List[str]] = {}
     for creator, info in users_posts_raw.items():
-        user_id = info['user_id']
-        post_dict = info['posts']
-        selected_posts = list(post_dict.values())
+        user_id: str = info['user_id']
+        post_dict: Dict[str, str] = info['posts']
+        selected_posts: List[str] = list(post_dict.values())
         if args.sets:
             selected_posts = [post_dict[s] for s in args.sets if s in post_dict]
         if selected_posts:
             users_posts[user_id] = selected_posts
     
-    user_count = len(users_posts)
-    post_count = sum(len(posts) for posts in users_posts.values())
+    user_count: int = len(users_posts)
+    post_count: int = sum(len(posts) for posts in users_posts.values())
     logger.info(f"Loaded {user_count} users with {post_count} posts")
     
-    downloaded_dict = load_downloaded_list(DOWNLOADED_LIST_FILE)
+    db: DownloadedDB = DownloadedDB(DOWNLOADED_LIST_FILE)
+    downloaded_dict: Dict[str, Dict[str, str]] = db.load()
     logger.info(f"Loaded {len(downloaded_dict)} previously downloaded files")
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -805,12 +829,12 @@ def main():
     init_func = partial(init_worker, jar)
     
     try:
-        executor = DaemonThreadPoolExecutor(max_workers=args.workers, initializer=init_func)
+        executor: DaemonThreadPoolExecutor = DaemonThreadPoolExecutor(max_workers=args.workers, initializer=init_func)
     except Exception as e:
         logger.critical(f"Failed to create executor: {e}")
         sys.exit(1)
     
-    attachments = collect_attachments(executor, users_posts, args.max_retries, args.backoff_factor, args.max_backoff)
+    attachments: List[Dict[str, Any]] = collect_attachments(executor, users_posts, args.max_retries, args.backoff_factor, args.max_backoff)
     
     if shutdown_event.is_set():
         logger.warning("Shutdown during attachment collection")
@@ -820,9 +844,9 @@ def main():
         sys.exit(0)
     
     with _download_lock:
-        to_process = [att for att in attachments if att['path'] not in downloaded_dict]
+        to_process: List[Dict[str, Any]] = [att for att in attachments if att['path'] not in downloaded_dict or downloaded_dict[att['path']]['status'] != 'completed']
     
-    total_attachments = len(to_process)
+    total_attachments: int = len(to_process)
     if total_attachments == 0:
         logger.info("No new attachments found")
         executor.shutdown(wait=False)
@@ -832,18 +856,18 @@ def main():
     
     logger.info(f"Processing {total_attachments} attachments")
     
-    completed_count = 0
-    failed_count = 0
+    completed_count: int = 0
+    failed_count: int = 0
     
     try:
-        futures = []
+        futures: List[_base.Future] = []
         for attachment in to_process:
             try:
-                future = executor.submit(
+                future: _base.Future = executor.submit(
                     process_attachment,
                     attachment,
                     downloaded_dict,
-                    DOWNLOADED_LIST_FILE,
+                    db,
                     args.max_retries,
                     args.backoff_factor,
                     args.max_backoff,
@@ -854,7 +878,7 @@ def main():
                 logger.error(f"Failed to submit process task for {attachment.get('name')}: {e}")
                 failed_count += 1
         
-        not_done = set(futures)
+        not_done: set[_base.Future] = set(futures)
         try:
             with tqdm(total=total_attachments, desc="Overall progress", leave=True, position=0) as overall_progress:
                 while not_done and not shutdown_event.is_set():
@@ -863,7 +887,7 @@ def main():
                     logger.debug(f"Processed {len(done)} tasks this iteration, {len(not_done)} remaining")
                     for future in done:
                         try:
-                            success = future.result()
+                            success: bool = future.result()
                             if success:
                                 completed_count += 1
                             else:

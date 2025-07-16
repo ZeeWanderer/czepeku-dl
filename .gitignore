@@ -8,3 +8,4 @@ downloaded_files.db
 *.db-shm
 *.db-wal
 *.ps1
+*.db
