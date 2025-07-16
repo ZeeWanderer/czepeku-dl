@@ -442,6 +442,7 @@ def extract_archive(file_path: str, extract_dir: str, pbar: tqdm) -> Optional[st
 
     try:
         filename: str = os.path.basename(file_path)
+        base_name: str = os.path.splitext(filename)[0].strip()
         with zipfile.ZipFile(file_path) as zf:
             logger.debug(f"Opened zip file {filename}")
             infolist: List[zipfile.ZipInfo] = zf.infolist()
@@ -475,7 +476,6 @@ def extract_archive(file_path: str, extract_dir: str, pbar: tqdm) -> Optional[st
             if len(top_dirs) == 1 and not has_supplements and list(top_dirs)[0]:
                 target: str = extract_dir
             else:
-                base_name: str = os.path.splitext(filename)[0]
                 target = os.path.join(extract_dir, base_name)
             
             logger.debug(f"Determined target directory: {target}")
@@ -502,7 +502,7 @@ def extract_archive(file_path: str, extract_dir: str, pbar: tqdm) -> Optional[st
                     return None
                 if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
                     continue
-                target_path: str = os.path.join(target, member.filename)
+                target_path: str = os.path.join(target, member.filename.lstrip('/'))
                 target_dir: str = os.path.dirname(target_path)
                 try:
                     os.makedirs(target_dir, exist_ok=True)
@@ -607,7 +607,7 @@ def process_attachment(attachment: Dict[str, Any], downloaded_dict: Dict[str, Di
     if shutdown_event.is_set():
         return False
         
-    filename: Optional[str] = attachment.get('name')
+    filename: Optional[str] = attachment.get('name').strip()
     attachment_path: str = attachment['path']
     
     with _download_lock:
