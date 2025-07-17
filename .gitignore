@@ -9,3 +9,4 @@ downloaded_files.db
 *.db-wal
 *.ps1
 *.db
+/maps
