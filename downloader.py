@@ -440,6 +440,11 @@ def extract_archive(file_path: str, extract_dir: str, pbar: tqdm) -> Optional[st
         logger.error(f"Invalid ZIP archive: {os.path.basename(file_path)}")
         return None
 
+    def sanitize_path(path: str) -> str:
+        parts = path.lstrip('/').split('/')
+        sanitized_parts = [p.strip() for p in parts if p.strip()]
+        return os.path.join(*sanitized_parts)
+
     try:
         filename: str = os.path.basename(file_path)
         base_name: str = os.path.splitext(filename)[0].strip()
@@ -463,7 +468,7 @@ def extract_archive(file_path: str, extract_dir: str, pbar: tqdm) -> Optional[st
             has_supplements: bool = False
             for m in infolist:
                 if '/' in m.filename:
-                    top: str = m.filename.split('/')[0]
+                    top: str = m.filename.split('/')[0].strip()
                     if any(top.startswith(j) for j in junk_prefixes):
                         continue
                     if any(top.startswith(s) for s in supplement_names):
@@ -502,7 +507,8 @@ def extract_archive(file_path: str, extract_dir: str, pbar: tqdm) -> Optional[st
                     return None
                 if member.filename.startswith(('__MACOSX/', '.DS_Store')) or member.filename.endswith('/.DS_Store'):
                     continue
-                target_path: str = os.path.join(target, member.filename.lstrip('/'))
+                sanitized_member_path = sanitize_path(member.filename)
+                target_path: str = os.path.join(target, sanitized_member_path)
                 target_dir: str = os.path.dirname(target_path)
                 try:
                     os.makedirs(target_dir, exist_ok=True)
