@@ -436,6 +436,10 @@ def extract_archive(file_path: str, extract_dir: str, pbar: tqdm) -> Optional[st
         logger.debug("Shutdown event set, aborting extraction")
         return None
         
+    if not os.path.exists(file_path):
+        logger.error(f"File not found: {file_path}")
+        return None
+
     if not zipfile.is_zipfile(file_path):
         logger.error(f"Invalid ZIP archive: {os.path.basename(file_path)}")
         return None
@@ -573,6 +577,9 @@ def extract_archive(file_path: str, extract_dir: str, pbar: tqdm) -> Optional[st
             for file in files:
                 if file.lower().endswith('.zip'):
                     nested_path: str = os.path.join(root, file)
+                    if not os.path.exists(nested_path):
+                        logger.warning(f"Nested zip file not found, skipping: {nested_path}")
+                        continue
                     logger.debug(f"Found nested zip: {nested_path}")
                     nested_target: Optional[str] = extract_archive(nested_path, root, pbar)
                     if nested_target is None:
