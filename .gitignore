@@ -10,3 +10,11 @@ downloaded_files.db
 *.ps1
 *.db
 /maps
+/.czepeku
+/czepeku
+*.log
+
+
+# Added by cargo
+
+/target
