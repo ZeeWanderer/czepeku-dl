@@ -265,7 +265,7 @@ def fetch_post_data(user_id: str, post_id: str, max_retries: int, backoff_factor
     if shutdown_event.is_set():
         return None
         
-    url: str = f"https://kemono.su/api/v1/{SERVICE}/user/{user_id}/post/{post_id}"
+    url: str = f"https://kemono.cr/api/v1/{SERVICE}/user/{user_id}/post/{post_id}"
     
     attempt: int = 0
     
@@ -651,7 +651,7 @@ def process_attachment(attachment: Dict[str, Any], downloaded_dict: Dict[str, Di
         
     session: requests.Session = thread_local.session
     
-    server: str = attachment.get('server', 'https://kemono.su')
+    server: str = attachment.get('server', 'https://kemono.cr')
     file_url: str = f"{server}/data{attachment_path}"
     local_path: str = os.path.join(DOWNLOAD_DIR, filename)
     
@@ -756,7 +756,7 @@ def collect_attachments(executor: ThreadPoolExecutor, users_posts: Dict[str, Lis
 def parse_arguments() -> argparse.Namespace:
     logger: logging.Logger = logging.getLogger(f"{__name__}.parse_arguments")
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
-        description="Download and extract Czepeku maps from Patreon via Kemono.su",
+        description="Download and extract Czepeku maps from Patreon via Kemono.cr",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument('-l', '--log-level', default='INFO', 
