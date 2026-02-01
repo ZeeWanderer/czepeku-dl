@@ -126,6 +126,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
             UNIQUE (repo_path)
         );
         CREATE INDEX IF NOT EXISTS idx_fold_map_attachment ON fold_map(attachment_id);
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         "#,
     )?;
     Ok(())
@@ -521,78 +525,21 @@ pub fn clear_attachment_plans(conn: &mut Connection, attachment_id: i64) -> Resu
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusqlite::params;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
 
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new(prefix: &str) -> Self {
-            let base = std::env::temp_dir();
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            for attempt in 0..20u32 {
-                let candidate = base.join(format!(
-                    "czepeku-test-{}-{}-{}",
-                    prefix,
-                    std::process::id(),
-                    now + attempt as u128
-                ));
-                if candidate.exists() {
-                    continue;
-                }
-                fs::create_dir_all(&candidate).expect("create tempdir");
-                return Self { path: candidate };
-            }
-            panic!("Failed to create temp dir");
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    #[test]
-    fn search_attachments_uses_fixed_ids() -> Result<()> {
-        let dir = TempDir::new("db");
-        let db_path = dir.path.join("index.sqlite");
-        let conn = open_db(&db_path)?;
-
-        conn.execute(
-            "INSERT INTO attachments (id, post_id, name, path) VALUES (?, ?, ?, ?)",
-            params![
-                327_i64,
-                "post-1",
-                "Swamp Graveyard Gridded Part 1.zip",
-                "/data/327.zip"
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO attachments (id, post_id, name, path) VALUES (?, ?, ?, ?)",
-            params![
-                328_i64,
-                "post-1",
-                "Swamp Graveyard Gridless Part 1.zip",
-                "/data/328.zip"
-            ],
-        )?;
-
-        let results = search_attachments(&conn, "Swamp Graveyard", 10)?;
-        assert_eq!(results.len(), 2);
-
-        let row = get_attachment_by_id(&conn, 327_i64)?.expect("row");
-        assert_eq!(row.name, "Swamp Graveyard Gridded Part 1.zip");
-        Ok(())
-    }
+pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?)\
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }

@@ -1,10 +1,12 @@
 use crate::db::{self, ExtractedFileRow, FoldMapRow};
 use crate::fsops::{move_with_fallback, path_from_slash, remove_any};
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path};
 use log::{debug, trace, warn};
+
+const FOLD_ALGO_VERSION: &str = "tree-v1";
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -22,6 +24,18 @@ pub fn plan_fold(
     attachment_name: &str,
     files: &[ExtractedFileRow],
 ) -> Result<FoldPlan> {
+    if let Some(existing) = db::get_meta(conn, "fold_algo")? {
+        if existing != FOLD_ALGO_VERSION {
+            warn!(
+                "Fold algorithm changed (db={}, current={})",
+                existing, FOLD_ALGO_VERSION
+            );
+            db::set_meta(conn, "fold_algo", FOLD_ALGO_VERSION)?;
+        }
+    } else {
+        db::set_meta(conn, "fold_algo", FOLD_ALGO_VERSION)?;
+    }
+
     let flatten_prefix = compute_flatten_prefix(files);
     let attachment_base = base_name_from_attachment(attachment_name);
     let attachment_no_part = strip_part_suffix(&attachment_base);
@@ -59,14 +73,23 @@ pub fn plan_fold(
                 variant_prefix.as_deref(),
                 true,
             );
-            let candidate_paths = build_repo_paths(
+            let (candidate_paths, paths_error) = match build_repo_paths(
                 &candidate_root,
                 flatten_prefix.as_deref(),
                 &part_rewrites,
                 variant_prefix.as_deref(),
                 files,
-            );
-            if has_conflicts(conn, repo_dir, attachment_id, &candidate_paths)? {
+            ) {
+                Ok(paths) => (paths, false),
+                Err(err) => {
+                    warn!(
+                        "Fold candidate path build failed for {}: {}",
+                        attachment_name, err
+                    );
+                    (Vec::new(), true)
+                }
+            };
+            if paths_error || has_conflicts(conn, repo_dir, attachment_id, &candidate_paths)? {
                 db::set_merge_group(conn, &group_key, false)?;
                 (ensure_unique_root(conn, repo_dir, &base_name, attachment_id)?, "part".to_string())
             } else {
@@ -254,6 +277,247 @@ fn compute_flatten_prefix(files: &[ExtractedFileRow]) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TreeNode {
+    name: String,
+    kind: NodeKind,
+    children: BTreeMap<String, TreeNode>,
+    original_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    Dir,
+    File,
+}
+
+impl TreeNode {
+    fn new_dir(name: String) -> Self {
+        Self {
+            name,
+            kind: NodeKind::Dir,
+            children: BTreeMap::new(),
+            original_path: None,
+        }
+    }
+
+    fn new_file(name: String, original_path: String) -> Self {
+        Self {
+            name,
+            kind: NodeKind::File,
+            children: BTreeMap::new(),
+            original_path: Some(original_path),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TreeEntry {
+    original_path: String,
+    rel_path: String,
+}
+
+fn build_tree_entries(
+    files: &[ExtractedFileRow],
+    flatten_prefix: Option<&str>,
+    part_rewrites: &HashMap<String, Option<String>>,
+    variant_prefix: Option<&str>,
+) -> Result<Vec<TreeEntry>> {
+    let mut root = TreeNode::new_dir(String::new());
+    for file in files {
+        insert_file(&mut root, &file.original_path);
+    }
+
+    apply_flatten_prefix(&mut root, flatten_prefix);
+    apply_part_rewrites(&mut root, part_rewrites)?;
+    apply_variant_prefix(&mut root, variant_prefix)?;
+
+    let mut entries = Vec::new();
+    collect_entries(&root, "", &mut entries);
+    Ok(entries)
+}
+
+fn insert_file(root: &mut TreeNode, path: &str) {
+    let comps: Vec<String> = Path::new(path)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(v) => Some(v.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    if comps.is_empty() {
+        return;
+    }
+
+    let mut current = root;
+    for (i, name) in comps.iter().enumerate() {
+        let is_last = i == comps.len() - 1;
+        if is_last {
+            let node = TreeNode::new_file(name.clone(), path.to_string());
+            current.children.entry(name.clone()).or_insert(node);
+        } else {
+            let entry = current
+                .children
+                .entry(name.clone())
+                .or_insert_with(|| TreeNode::new_dir(name.clone()));
+            if entry.kind != NodeKind::Dir {
+                return;
+            }
+            current = entry;
+        }
+    }
+}
+
+fn apply_flatten_prefix(root: &mut TreeNode, prefix: Option<&str>) {
+    let Some(prefix) = prefix else { return; };
+    if let Some(node) = root.children.remove(prefix) {
+        if node.kind == NodeKind::Dir && root.children.is_empty() {
+            root.children = node.children;
+        } else {
+            root.children.insert(prefix.to_string(), node);
+        }
+    }
+}
+
+fn apply_part_rewrites(
+    root: &mut TreeNode,
+    part_rewrites: &HashMap<String, Option<String>>,
+) -> Result<()> {
+    if part_rewrites.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<String> = part_rewrites.keys().cloned().collect();
+    for key in keys {
+        let rewrite = part_rewrites.get(&key).cloned().unwrap_or(None);
+        let Some(node) = root.children.remove(&key) else { continue; };
+        if node.kind != NodeKind::Dir {
+            root.children.insert(key, node);
+            continue;
+        }
+        match rewrite {
+            None => merge_node_into_dir(root, node)?,
+            Some(dest_name) => {
+                if dest_name == key {
+                    root.children.insert(key, node);
+                    continue;
+                }
+                let dest = root
+                    .children
+                    .entry(dest_name.clone())
+                    .or_insert_with(|| TreeNode::new_dir(dest_name.clone()));
+                if dest.kind != NodeKind::Dir {
+                    return Err(anyhow::anyhow!(
+                        "Part rewrite conflict: {} is not a directory",
+                        dest_name
+                    ));
+                }
+                merge_node_into_dir(dest, node)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_variant_prefix(root: &mut TreeNode, variant_prefix: Option<&str>) -> Result<()> {
+    let Some(variant) = variant_prefix else { return Ok(()); };
+    if root.children.len() == 1 {
+        if let Some(node) = root.children.get(variant) {
+            if node.kind == NodeKind::Dir {
+                return Ok(());
+            }
+        }
+    }
+
+    let mut dest = if let Some(node) = root.children.remove(variant) {
+        if node.kind != NodeKind::Dir {
+            return Err(anyhow::anyhow!(
+                "Variant path conflict: {} is not a directory",
+                variant
+            ));
+        }
+        node
+    } else {
+        TreeNode::new_dir(variant.to_string())
+    };
+
+    let keys: Vec<String> = root.children.keys().cloned().collect();
+    for key in keys {
+        if key == variant {
+            continue;
+        }
+        if let Some(node) = root.children.remove(&key) {
+            merge_node_into_dir(&mut dest, node)?;
+        }
+    }
+
+    root.children.insert(variant.to_string(), dest);
+    Ok(())
+}
+
+fn merge_node_into_dir(dest: &mut TreeNode, mut node: TreeNode) -> Result<()> {
+    if node.kind != NodeKind::Dir {
+        let name = node.name.clone();
+        if let Some(existing) = dest.children.get(&name) {
+            return Err(anyhow::anyhow!(
+                "Path collision while merging {}",
+                existing.name
+            ));
+        }
+        dest.children.insert(name, node);
+        return Ok(());
+    }
+
+    let children = std::mem::take(&mut node.children);
+    for (_name, child) in children {
+        let name = child.name.clone();
+        if let Some(existing) = dest.children.get_mut(&name) {
+            if existing.kind == NodeKind::Dir && child.kind == NodeKind::Dir {
+                merge_node_into_dir(existing, child)?;
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Path collision while merging {}",
+                    name
+                ));
+            }
+        } else {
+            dest.children.insert(name, child);
+        }
+    }
+    Ok(())
+}
+
+fn collect_entries(node: &TreeNode, prefix: &str, out: &mut Vec<TreeEntry>) {
+    match node.kind {
+        NodeKind::File => {
+            let rel = if prefix.is_empty() {
+                node.name.clone()
+            } else if prefix == node.name || prefix.ends_with(&format!("/{}", node.name)) {
+                prefix.to_string()
+            } else {
+                format!("{}/{}", prefix, node.name)
+            };
+            if let Some(original) = node.original_path.clone() {
+                out.push(TreeEntry {
+                    original_path: original,
+                    rel_path: rel,
+                });
+            }
+        }
+        NodeKind::Dir => {
+            for child in node.children.values() {
+                let mut next = prefix.to_string();
+                if !child.name.is_empty() {
+                    if !next.is_empty() {
+                        next.push('/');
+                    }
+                    next.push_str(&child.name);
+                }
+                collect_entries(child, &next, out);
+            }
+        }
+    }
+}
+
 fn build_mappings(
     conn: &rusqlite::Connection,
     attachment_id: i64,
@@ -264,19 +528,11 @@ fn build_mappings(
     variant_prefix: Option<&str>,
     files: &[ExtractedFileRow],
 ) -> Result<Vec<FoldMapRow>> {
+    let entries = build_tree_entries(files, flatten_prefix, part_rewrites, variant_prefix)?;
     let mut seen_repo = HashSet::new();
     let mut mappings = Vec::new();
-    for file in files {
-        let normalized = normalize_path(
-            &file.original_path,
-            flatten_prefix,
-            part_rewrites,
-            variant_prefix,
-        );
-        if normalized.is_empty() {
-            continue;
-        }
-        let repo_path = join_repo_path(repo_root, &normalized);
+    for entry in entries {
+        let repo_path = join_repo_path(repo_root, &entry.rel_path);
         if !seen_repo.insert(repo_path.clone()) {
             return Err(anyhow::anyhow!("Duplicate repo path detected: {}", repo_path));
         }
@@ -284,7 +540,7 @@ fn build_mappings(
             return Err(anyhow::anyhow!("Repo path already in use: {}", repo_path));
         }
         mappings.push(FoldMapRow {
-            original_path: file.original_path.clone(),
+            original_path: entry.original_path,
             repo_path,
             rule: rule.to_string(),
         });
@@ -430,21 +686,12 @@ fn build_repo_paths(
     part_rewrites: &HashMap<String, Option<String>>,
     variant_prefix: Option<&str>,
     files: &[ExtractedFileRow],
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for file in files {
-        let normalized = normalize_path(
-            &file.original_path,
-            prefix,
-            part_rewrites,
-            variant_prefix,
-        );
-        if normalized.is_empty() {
-            continue;
-        }
-        out.push(join_repo_path(root, &normalized));
-    }
-    out
+) -> Result<Vec<String>> {
+    let entries = build_tree_entries(files, prefix, part_rewrites, variant_prefix)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| join_repo_path(root, &entry.rel_path))
+        .collect())
 }
 
 fn ensure_unique_root(
@@ -725,5 +972,66 @@ mod tests {
     fn strip_part_suffix_removes_part() {
         let base = strip_part_suffix("Dungeon Part 2");
         assert_eq!(base, "Dungeon");
+    }
+
+    #[test]
+    fn tree_adds_variant_prefix_when_missing() {
+        let files = build_files(&["a.png"]);
+        let entries = build_tree_entries(&files, None, &HashMap::new(), Some("Gridded"))
+            .expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rel_path, "Gridded/a.png");
+    }
+
+    #[test]
+    fn tree_keeps_existing_variant_folder() {
+        let files = build_files(&["Gridded/a.png"]);
+        let entries = build_tree_entries(&files, None, &HashMap::new(), Some("Gridded"))
+            .expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rel_path, "Gridded/a.png");
+    }
+
+    #[test]
+    fn tree_drops_part_folder_when_rewrite_none() {
+        let files = build_files(&["Part 1/a.png"]);
+        let mut rewrites = HashMap::new();
+        rewrites.insert("Part 1".to_string(), None);
+        let entries = build_tree_entries(&files, None, &rewrites, None).expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].rel_path, "a.png");
+    }
+
+    #[test]
+    fn tree_merges_part_into_existing_folder() {
+        let files = build_files(&["Part 1/a.png", "Gridded/b.png"]);
+        let mut rewrites = HashMap::new();
+        rewrites.insert("Part 1".to_string(), Some("Gridded".to_string()));
+        let mut entries = build_tree_entries(&files, None, &rewrites, None).expect("entries");
+        entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].rel_path, "Gridded/a.png");
+        assert_eq!(entries[1].rel_path, "Gridded/b.png");
+    }
+
+    #[test]
+    fn tree_detects_merge_collision() {
+        let files = build_files(&["Part 1/a.png", "Gridded/a.png"]);
+        let mut rewrites = HashMap::new();
+        rewrites.insert("Part 1".to_string(), Some("Gridded".to_string()));
+        let result = build_tree_entries(&files, None, &rewrites, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plan_fold_uses_unique_root_when_existing() {
+        let (_dir, conn, repo_dir) = setup();
+        let files = build_files(&["Map/a.png"]);
+        let existing = repo_dir.join("Map");
+        fs::create_dir_all(&existing).expect("create existing");
+        fs::write(existing.join("a.png"), b"hi").expect("write existing");
+
+        let plan = plan_fold(&conn, &repo_dir, 9, "Map.zip", &files).expect("plan");
+        assert_ne!(plan.repo_root, "Map");
     }
 }

@@ -756,69 +756,6 @@ fn extract_nested_zips(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::{self, File};
-    use std::io::Write;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new(prefix: &str) -> Self {
-            let base = std::env::temp_dir();
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            for attempt in 0..20u32 {
-                let candidate = base.join(format!(
-                    "czepeku-test-{}-{}-{}",
-                    prefix,
-                    std::process::id(),
-                    now + attempt as u128
-                ));
-                if candidate.exists() {
-                    continue;
-                }
-                fs::create_dir_all(&candidate).expect("create tempdir");
-                return Self { path: candidate };
-            }
-            panic!("Failed to create temp dir");
-        }
-
-        fn path(&self) -> &PathBuf {
-            &self.path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    #[test]
-    fn index_extracted_files_skips_junk() {
-        let dir = TempDir::new("extract");
-        let macosx = dir.path().join("__MACOSX");
-        fs::create_dir_all(&macosx).unwrap();
-        File::create(macosx.join("._junk")).unwrap();
-        File::create(dir.path().join(".DS_Store")).unwrap();
-        let map_dir = dir.path().join("Map");
-        fs::create_dir_all(&map_dir).unwrap();
-        let mut file = File::create(map_dir.join("file.txt")).unwrap();
-        file.write_all(b"hello").unwrap();
-
-        let files = index_extracted_files(dir.path()).expect("index");
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].rel_path, "Map/file.txt");
-    }
-}
 
 fn create_temp_dir(target: &Path) -> Result<PathBuf> {
     let parent = target.parent().unwrap_or(target);

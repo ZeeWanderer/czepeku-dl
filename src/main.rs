@@ -1,13 +1,3 @@
-mod cli;
-mod config;
-mod db;
-mod download;
-mod extract;
-mod fsops;
-mod fold;
-mod kemono;
-mod rate_limit;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use simplelog::{
@@ -21,9 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use walkdir::WalkDir;
 
-use crate::cli::{Cli, Commands};
-use crate::fsops::{move_with_fallback, path_from_slash, path_to_slash};
-use crate::rate_limit::RateLimiter;
+use czepeku::cli::{self, Cli, Commands};
+use czepeku::fsops::{move_with_fallback, path_from_slash, path_to_slash};
+use czepeku::rate_limit::RateLimiter;
+use czepeku::{config, db, download, extract, fold, kemono};
 
 struct Paths {
     data_dir: PathBuf,
@@ -88,7 +79,7 @@ fn resolve_paths(cli: &Cli) -> Result<Paths> {
     let config_path = cli
         .config
         .clone()
-        .unwrap_or_else(|| PathBuf::from("users_posts.json"));
+        .unwrap_or_else(|| data_dir.join("creators.json"));
 
     Ok(Paths {
         data_dir,
@@ -108,6 +99,32 @@ fn resolve_cookies_path(cli: &Cli) -> Option<PathBuf> {
         return Some(path);
     }
     None
+}
+
+fn resolve_config_path(paths: &Paths) -> Result<PathBuf> {
+    let legacy = PathBuf::from("users_posts.json");
+    if !paths.config_path.exists() && legacy.exists() {
+        log::warn!(
+            "Legacy config {} detected but ignored by default. Use --config to load it.",
+            legacy.display()
+        );
+    }
+    Ok(paths.config_path.clone())
+}
+
+fn ensure_config_exists(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, config::default_creators_json())
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
 }
 
 fn compute_workers(requested: Option<usize>, items_len: usize) -> usize {
@@ -236,17 +253,19 @@ fn parse_level(level: &str) -> Result<LevelFilter> {
 }
 
 fn run_index(cli: &Cli, paths: &Paths, args: &cli::IndexArgs) -> Result<()> {
-    if !paths.config_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Config file not found: {}",
-            paths.config_path.display()
-        ));
+    let config_path = resolve_config_path(paths)?;
+    if !config_path.exists() {
+        ensure_config_exists(&config_path)?;
+        log::info!(
+            "Config file created at {} using defaults",
+            config_path.display()
+        );
     }
 
     log::info!("Index start base_url={}", cli.base_url);
-    log::info!("Config file: {}", paths.config_path.display());
+    log::info!("Config file: {}", config_path.display());
 
-    let config = config::load_users_posts(&paths.config_path)?;
+    let config = config::load_users_posts(&config_path)?;
     std::fs::create_dir_all(&paths.data_dir)
         .with_context(|| format!("Failed to create {}", paths.data_dir.display()))?;
 
@@ -327,7 +346,6 @@ fn run_index(cli: &Cli, paths: &Paths, args: &cli::IndexArgs) -> Result<()> {
         }
     }
 
-    println!("Indexed {} attachments.", attachment_count);
     log::info!("Index completed attachments={}", attachment_count);
     Ok(())
 }
@@ -487,7 +505,25 @@ fn run_repair(cli: &Cli, paths: &Paths, args: &cli::RepairArgs) -> Result<()> {
         if row.status != "completed" {
             continue;
         }
-        let mappings = db::list_fold_map(&conn, row.attachment_id)?;
+        let mut mappings = db::list_fold_map(&conn, row.attachment_id)?;
+        if mappings.is_empty() {
+            if let Some(att) = db::get_attachment_by_id(&conn, row.attachment_id)? {
+                let extracted = db::list_extracted_files(&conn, row.attachment_id)?;
+                if !extracted.is_empty() {
+                    log::debug!(
+                        "Repair rebuild fold_map for id={} name={}",
+                        row.attachment_id,
+                        att.name
+                    );
+                    if let Ok(plan) =
+                        fold::plan_fold(&conn, &paths.repo_dir, row.attachment_id, &att.name, &extracted)
+                    {
+                        db::replace_fold_map(&mut conn, row.attachment_id, &plan.mappings)?;
+                        mappings = plan.mappings;
+                    }
+                }
+            }
+        }
         if mappings.is_empty() {
             missing_ids.push(row.attachment_id);
             continue;

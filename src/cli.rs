@@ -19,7 +19,11 @@ pub struct Cli {
     )]
     pub cookies: Option<PathBuf>,
 
-    #[arg(long, global = true, help = "Path to users_posts.json (default: ./users_posts.json)")]
+    #[arg(
+        long,
+        global = true,
+        help = "Path to creators config (default: <data-dir>/creators.json)"
+    )]
     pub config: Option<PathBuf>,
 
     #[arg(long, global = true, help = "Data directory (default: ./.czepeku)")]
