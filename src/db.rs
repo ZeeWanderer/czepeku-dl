@@ -27,6 +27,18 @@ pub struct DownloadRecord {
     pub size: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DownloadRow {
+    pub path: String,
+    pub status: String,
+    pub local_zip: Option<String>,
+    pub extract_path: Option<String>,
+    pub updated_at: Option<String>,
+    pub attachment_id: Option<i64>,
+    pub name: Option<String>,
+}
+
 pub fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("Failed to open db {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -72,6 +84,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_downloads_sha256 ON downloads(sha256);
+        CREATE TABLE IF NOT EXISTS merge_map (
+            source_path TEXT PRIMARY KEY,
+            merged_path TEXT NOT NULL,
+            updated_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_merge_map_merged ON merge_map(merged_path);
         "#,
     )?;
     Ok(())
@@ -181,17 +199,45 @@ pub fn get_attachment_by_id(conn: &Connection, id: i64) -> Result<Option<Attachm
     .map_err(Into::into)
 }
 
-pub fn list_all_attachments(conn: &Connection) -> Result<Vec<AttachmentRow>> {
+pub fn get_attachment_by_path(conn: &Connection, path: &str) -> Result<Option<AttachmentRow>> {
+    conn.query_row(
+        r#"
+        SELECT a.id, a.name, a.path, a.post_id, a.sha256, a.size, a.server, p.title, p.published
+        FROM attachments a
+        LEFT JOIN posts p ON p.id = a.post_id
+        WHERE a.path = ?
+        "#,
+        params![path],
+        |row| {
+            Ok(AttachmentRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                post_id: row.get(3)?,
+                sha256: row.get(4)?,
+                size: row.get(5)?,
+                server: row.get(6)?,
+                title: row.get(7)?,
+                published: row.get(8)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn list_attachments(conn: &Connection, limit: usize) -> Result<Vec<AttachmentRow>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT a.id, a.name, a.path, a.post_id, a.sha256, a.size, a.server, p.title, p.published
         FROM attachments a
         LEFT JOIN posts p ON p.id = a.post_id
         ORDER BY a.name
+        LIMIT ?
         "#,
     )?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(params![limit as i64], |row| {
             Ok(AttachmentRow {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -206,6 +252,78 @@ pub fn list_all_attachments(conn: &Connection) -> Result<Vec<AttachmentRow>> {
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+pub fn list_downloads(
+    conn: &Connection,
+    status: Option<&str>,
+    limit: usize,
+) -> Result<Vec<DownloadRow>> {
+    let mut rows = Vec::new();
+    let sql = r#"
+        SELECT d.path, d.status, d.local_zip, d.extract_path, d.updated_at, d.attachment_id, a.name
+        FROM downloads d
+        LEFT JOIN attachments a ON a.path = d.path
+        WHERE (?1 IS NULL OR d.status = ?1)
+        ORDER BY d.updated_at DESC
+        LIMIT ?2
+    "#;
+    let mut stmt = conn.prepare(sql)?;
+    let mut iter = stmt.query(params![status, limit as i64])?;
+    while let Some(row) = iter.next()? {
+        rows.push(DownloadRow {
+            path: row.get(0)?,
+            status: row.get(1)?,
+            local_zip: row.get(2)?,
+            extract_path: row.get(3)?,
+            updated_at: row.get(4)?,
+            attachment_id: row.get(5)?,
+            name: row.get(6)?,
+        });
+    }
+    Ok(rows)
+}
+
+pub fn update_download_status(conn: &Connection, path: &str, status: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO downloads (path, status, updated_at) VALUES (?, ?, datetime('now'))\
+         ON CONFLICT(path) DO UPDATE SET status=excluded.status, updated_at=datetime('now')",
+        params![path, status],
+    )?;
+    Ok(())
+}
+
+pub fn update_download_extract_path(
+    conn: &Connection,
+    old_path: &str,
+    new_path: &str,
+    status: &str,
+) -> Result<usize> {
+    let changed = conn.execute(
+        "UPDATE downloads SET extract_path = ?, status = ?, updated_at = datetime('now')\
+         WHERE extract_path = ?",
+        params![new_path, status, old_path],
+    )?;
+    Ok(changed)
+}
+
+pub fn upsert_merge_map(conn: &Connection, source: &str, merged: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO merge_map (source_path, merged_path, updated_at) VALUES (?, ?, datetime('now'))\
+         ON CONFLICT(source_path) DO UPDATE SET merged_path=excluded.merged_path, updated_at=datetime('now')",
+        params![source, merged],
+    )?;
+    Ok(())
+}
+
+pub fn get_merge_target(conn: &Connection, source: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT merged_path FROM merge_map WHERE source_path = ?",
+        params![source],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 pub fn find_completed_by_sha256(conn: &Connection, sha256: &str) -> Result<Option<DownloadRecord>> {

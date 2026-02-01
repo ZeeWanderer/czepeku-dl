@@ -35,7 +35,10 @@ fn main() -> Result<()> {
         Commands::Index(args) => run_index(&cli, &paths, args)?,
         Commands::Search(args) => run_search(&paths.db_path, &args.query, args.limit)?,
         Commands::Download(args) => run_download(&cli, &paths, args)?,
-        Commands::DownloadAll(args) => run_download_all(&cli, &paths, args)?,
+        Commands::List(args) => run_list(&paths.db_path, args)?,
+        Commands::Repair(args) => run_repair(&cli, &paths, args)?,
+        Commands::Remove(args) => run_remove(&cli, &paths, args)?,
+        Commands::Normalize(args) => run_normalize(&paths, args)?,
     }
 
     Ok(())
@@ -235,21 +238,33 @@ fn run_download(cli: &Cli, paths: &Paths, args: &cli::DownloadArgs) -> Result<()
     let conn = db::open_db(&paths.db_path)?;
 
     let mut items = Vec::new();
-    if let Some(id) = args.id {
-        if let Some(row) = db::get_attachment_by_id(&conn, id)? {
-            items.push(row);
-        } else {
-            println!("No attachment with id {}", id);
-            return Ok(());
-        }
-    } else if let Some(query) = args.query.as_deref() {
-        items = db::search_attachments(&conn, query, args.limit)?;
-        if items.is_empty() {
-            println!("No matches found.");
-            return Ok(());
-        }
+    let mut seen_paths = HashSet::new();
+
+    if args.all {
+        items = db::list_attachments(&conn, args.limit)?;
     } else {
-        return Err(anyhow::anyhow!("Provide --id or a query"));
+        for id in &args.id {
+            if let Some(row) = db::get_attachment_by_id(&conn, *id)? {
+                if seen_paths.insert(row.path.clone()) {
+                    items.push(row);
+                }
+            } else {
+                println!("No attachment with id {}", id);
+            }
+        }
+
+        if let Some(query) = args.query.as_deref() {
+            let results = db::search_attachments(&conn, query, args.limit)?;
+            for row in results {
+                if seen_paths.insert(row.path.clone()) {
+                    items.push(row);
+                }
+            }
+        }
+
+        if items.is_empty() {
+            return Err(anyhow::anyhow!("Provide --id or a query with matches, or use --all"));
+        }
     }
 
     let client = kemono::build_client(&cli.base_url, cli.cookies.as_deref())?;
@@ -258,6 +273,7 @@ fn run_download(cli: &Cli, paths: &Paths, args: &cli::DownloadArgs) -> Result<()
         download_dir: paths.download_dir.clone(),
         repo_dir: paths.repo_dir.clone(),
         keep_zip: args.keep_zip,
+        max_unpacked_bytes: cli.max_unpacked_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
         max_retries: cli.max_retries,
         backoff_factor: cli.backoff_factor,
         max_backoff: cli.max_backoff,
@@ -268,28 +284,234 @@ fn run_download(cli: &Cli, paths: &Paths, args: &cli::DownloadArgs) -> Result<()
     Ok(())
 }
 
-fn run_download_all(cli: &Cli, paths: &Paths, args: &cli::DownloadAllArgs) -> Result<()> {
-    let conn = db::open_db(&paths.db_path)?;
-    let items = db::list_all_attachments(&conn)?;
+fn run_list(db_path: &Path, args: &cli::ListArgs) -> Result<()> {
+    let conn = db::open_db(db_path)?;
+    match args.r#type {
+        cli::ListType::Downloads => {
+            let rows = db::list_downloads(&conn, args.status.as_deref(), args.limit)?;
+            if rows.is_empty() {
+                println!("No downloads found.");
+                return Ok(());
+            }
+            for row in rows {
+                let id = row
+                    .attachment_id
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let name = row.name.clone().unwrap_or_else(|| row.path.clone());
+                let extract = row.extract_path.unwrap_or_else(|| "".to_string());
+                let updated = row.updated_at.unwrap_or_else(|| "".to_string());
+                println!("[{}] {} | {} | {}", id, row.status, name, extract);
+                if !updated.is_empty() {
+                    println!("    updated: {}", updated);
+                }
+            }
+        }
+        cli::ListType::Attachments => {
+            let rows = if let Some(query) = args.query.as_deref() {
+                db::search_attachments(&conn, query, args.limit)?
+            } else {
+                db::list_attachments(&conn, args.limit)?
+            };
+            if rows.is_empty() {
+                println!("No attachments found.");
+                return Ok(());
+            }
+            for row in rows {
+                let title = row.title.clone().unwrap_or_else(|| "(no title)".to_string());
+                let published = row.published.clone().unwrap_or_else(|| "".to_string());
+                println!("[{}] {} | {} | {}", row.id, row.name, title, published);
+            }
+        }
+    }
+    Ok(())
+}
 
-    if items.is_empty() {
-        println!("No indexed attachments. Run index first.");
+fn run_repair(cli: &Cli, paths: &Paths, args: &cli::RepairArgs) -> Result<()> {
+    let conn = db::open_db(&paths.db_path)?;
+    let downloads = db::list_downloads(&conn, None, 10_000)?;
+
+    let mut missing = Vec::new();
+
+    for row in downloads {
+        if let Some(extract_rel) = row.extract_path.clone() {
+            let extract_path = paths.repo_dir.join(&extract_rel);
+            if !extract_path.exists() {
+                if let Some(merged_rel) = db::get_merge_target(&conn, &extract_rel)? {
+                    let merged_path = paths.repo_dir.join(&merged_rel);
+                    if merged_path.exists() {
+                        let _ = db::update_download_extract_path(
+                            &conn,
+                            &extract_rel,
+                            &merged_rel,
+                            "merged",
+                        )?;
+                        continue;
+                    }
+                }
+                missing.push(row);
+            }
+        } else {
+            missing.push(row);
+        }
+    }
+
+    if args.dry_run {
+        println!("Repair dry-run: missing {}", missing.len());
         return Ok(());
     }
 
-    let client = kemono::build_client(&cli.base_url, cli.cookies.as_deref())?;
-    let options = download::DownloadOptions {
-        base_url: cli.base_url.clone(),
-        download_dir: paths.download_dir.clone(),
-        repo_dir: paths.repo_dir.clone(),
-        keep_zip: args.keep_zip,
-        max_retries: cli.max_retries,
-        backoff_factor: cli.backoff_factor,
-        max_backoff: cli.max_backoff,
-        workers: args.workers,
-    };
+    if args.remove_missing {
+        let missing_count = missing.len();
+        for row in &missing {
+            db::update_download_status(&conn, &row.path, "removed")?;
+        }
+        println!("Marked {} missing items as removed.", missing_count);
+        return Ok(());
+    }
 
-    download::download_items(&paths.db_path, client, items, options)?;
+    if args.redownload {
+        let mut items = Vec::new();
+        for row in &missing {
+            if let Some(att) = db::get_attachment_by_path(&conn, &row.path)? {
+                items.push(att);
+            }
+        }
+        if items.is_empty() {
+            println!("No missing items found in attachments table.");
+            return Ok(());
+        }
+        let client = kemono::build_client(&cli.base_url, cli.cookies.as_deref())?;
+        let options = download::DownloadOptions {
+            base_url: cli.base_url.clone(),
+            download_dir: paths.download_dir.clone(),
+            repo_dir: paths.repo_dir.clone(),
+            keep_zip: false,
+            max_unpacked_bytes: cli.max_unpacked_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+            max_retries: cli.max_retries,
+            backoff_factor: cli.backoff_factor,
+            max_backoff: cli.max_backoff,
+            workers: 4,
+        };
+        let item_count = items.len();
+        download::download_items(&paths.db_path, client, items, options)?;
+        println!("Redownloaded {} items.", item_count);
+        return Ok(());
+    }
+
+    println!("Repair complete.");
+    Ok(())
+}
+
+fn run_remove(_cli: &Cli, paths: &Paths, args: &cli::RemoveArgs) -> Result<()> {
+    let conn = db::open_db(&paths.db_path)?;
+    let mut items = Vec::new();
+    let mut seen_paths = HashSet::new();
+
+    for id in &args.id {
+        if let Some(row) = db::get_attachment_by_id(&conn, *id)? {
+            if seen_paths.insert(row.path.clone()) {
+                items.push(row);
+            }
+        }
+    }
+
+    if let Some(query) = args.query.as_deref() {
+        let results = db::search_attachments(&conn, query, 10_000)?;
+        for row in results {
+            if seen_paths.insert(row.path.clone()) {
+                items.push(row);
+            }
+        }
+    }
+
+    if items.is_empty() {
+        return Err(anyhow::anyhow!("Provide --id or a query with matches"));
+    }
+
+    let mut removed = 0usize;
+    for item in items {
+        let download = db::get_download_status(&conn, &item.path)?;
+        let mut deleted_any = false;
+
+        if matches!(args.what, cli::RemoveWhat::Extract | cli::RemoveWhat::Both) {
+            if let Some(extract_rel) = download.as_ref().and_then(|d| d.extract_path.clone()) {
+                let extract_path = paths.repo_dir.join(&extract_rel);
+                if extract_path.exists() {
+                    if args.dry_run {
+                        println!("Would remove {}", extract_path.display());
+                    } else {
+                        std::fs::remove_dir_all(&extract_path).ok();
+                        deleted_any = true;
+                    }
+                }
+            }
+        }
+
+        if matches!(args.what, cli::RemoveWhat::Zip | cli::RemoveWhat::Both) {
+            if let Some(zip_path) = download.as_ref().and_then(|d| d.local_zip.clone()) {
+                let zip_path = PathBuf::from(zip_path);
+                if zip_path.exists() {
+                    if args.dry_run {
+                        println!("Would remove {}", zip_path.display());
+                    } else {
+                        std::fs::remove_file(&zip_path).ok();
+                        deleted_any = true;
+                    }
+                }
+            }
+        }
+
+        if !args.dry_run && deleted_any {
+            db::update_download_status(&conn, &item.path, "removed")?;
+        }
+        removed += 1;
+    }
+
+    println!("Processed {} items.", removed);
+    Ok(())
+}
+
+fn run_normalize(paths: &Paths, args: &cli::NormalizeArgs) -> Result<()> {
+    let conn = db::open_db(&paths.db_path)?;
+    let flattened = extract::normalize_repo_flatten(&paths.repo_dir, args.dry_run)?;
+    let mut merged = 0usize;
+
+    if args.merge {
+        let groups = extract::find_part_groups(&paths.repo_dir)?;
+        for group in groups {
+            let merged_ok = extract::merge_part_group(&group, args.dry_run)?;
+            if merged_ok {
+                merged += 1;
+                let base_rel = group
+                    .base_path
+                    .strip_prefix(&paths.repo_dir)
+                    .unwrap_or(&group.base_path)
+                    .to_string_lossy()
+                    .to_string();
+                for part in &group.part_paths {
+                    let part_rel = part
+                        .strip_prefix(&paths.repo_dir)
+                        .unwrap_or(part)
+                        .to_string_lossy()
+                        .to_string();
+                    if !args.dry_run {
+                        db::upsert_merge_map(&conn, &part_rel, &base_rel)?;
+                        let _ = db::update_download_extract_path(&conn, &part_rel, &base_rel, "merged")?;
+                    }
+                }
+            }
+        }
+    }
+
+    if args.dry_run {
+        println!(
+            "Normalize dry-run: {} folders would be flattened, {} part groups would be merged.",
+            flattened, merged
+        );
+    } else {
+        println!("Normalized {} folders, merged {} part groups.", flattened, merged);
+    }
     Ok(())
 }
 

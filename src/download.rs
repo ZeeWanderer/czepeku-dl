@@ -17,6 +17,7 @@ pub struct DownloadOptions {
     pub download_dir: PathBuf,
     pub repo_dir: PathBuf,
     pub keep_zip: bool,
+    pub max_unpacked_bytes: Option<u64>,
     pub max_retries: u32,
     pub backoff_factor: f32,
     pub max_backoff: u64,
@@ -140,7 +141,12 @@ fn process_item(
     match download_result {
         Ok(()) => {
             progress.finish_with_message(format!("Downloaded {}", item.name));
-            let extract_path = extract::extract_zip(&zip_path, &options.repo_dir, options.keep_zip)?;
+            let extract_path = extract::extract_zip(
+                &zip_path,
+                &options.repo_dir,
+                options.keep_zip,
+                options.max_unpacked_bytes,
+            )?;
             let rel_extract = extract_path
                 .strip_prefix(&options.repo_dir)
                 .unwrap_or(&extract_path)
