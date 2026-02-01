@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use log::{debug, warn};
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, COOKIE, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, COOKIE, REFERER, USER_AGENT};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::rate_limit::RateLimiter;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Post {
     pub id: String,
@@ -41,19 +42,31 @@ pub struct PostSummary {
 
 pub fn build_client(base_url: &str, cookies_path: Option<&Path>) -> Result<Client> {
     let mut headers = HeaderMap::new();
+    let ua = format!(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 czepeku/{}",
+        env!("CARGO_PKG_VERSION")
+    );
     headers.insert(
         USER_AGENT,
-        HeaderValue::from_static(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ),
+        HeaderValue::from_str(&ua).context("Invalid user-agent header")?,
     );
     headers.insert(ACCEPT, HeaderValue::from_static("text/css"));
+    headers.insert(
+        ACCEPT_LANGUAGE,
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    if let Ok(referer) = HeaderValue::from_str(base_url) {
+        headers.insert(REFERER, referer);
+    }
 
     if let Some(path) = cookies_path {
+        debug!("Using cookies file {}", path.display());
         if let Some(cookie_header) = load_cookie_header(path, base_url)? {
             headers.insert(COOKIE, HeaderValue::from_str(&cookie_header)?);
         }
+    } else {
+        debug!("No cookies configured");
     }
 
     let client = Client::builder()
@@ -70,7 +83,11 @@ pub fn fetch_post(
     service: &str,
     user_id: &str,
     post_id: &str,
+    rate_limiter: Option<&RateLimiter>,
 ) -> Result<PostEnvelope> {
+    if let Some(limiter) = rate_limiter {
+        limiter.wait();
+    }
     let url = format!(
         "{}/api/v1/{}/user/{}/post/{}",
         trim_slash(base_url),
@@ -119,6 +136,7 @@ pub fn list_posts(
     base_url: &str,
     service: &str,
     user_id: &str,
+    rate_limiter: Option<&RateLimiter>,
 ) -> Result<Vec<PostSummary>> {
     let mut posts = Vec::new();
     let mut offset = 0;
@@ -131,6 +149,10 @@ pub fn list_posts(
             user_id,
             offset
         );
+
+        if let Some(limiter) = rate_limiter {
+            limiter.wait();
+        }
 
         let response = client
             .get(&url)
@@ -171,6 +193,10 @@ fn trim_slash(base: &str) -> &str {
 }
 
 fn load_cookie_header(path: &Path, base_url: &str) -> Result<Option<String>> {
+    if !path.exists() {
+        warn!("Cookie file not found: {}", path.display());
+        return Ok(None);
+    }
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read cookie file {}", path.display()))?;
     let host = base_url
@@ -229,6 +255,7 @@ fn load_cookie_header(path: &Path, base_url: &str) -> Result<Option<String>> {
     if cookies.is_empty() {
         Ok(None)
     } else {
+        debug!("Loaded {} cookies for {}", cookies.len(), host);
         Ok(Some(cookies.join("; ")))
     }
 }

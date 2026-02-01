@@ -1,9 +1,13 @@
+#![allow(dead_code)]
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use log::warn;
+use log::{debug, trace, warn};
+use crate::fsops::path_to_slash;
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
@@ -15,6 +19,148 @@ pub fn extract_zip(
 ) -> Result<PathBuf> {
     let mut visited = HashSet::new();
     extract_zip_inner(file_path, extract_root, keep_zip, max_unpacked_bytes, &mut visited)
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedFile {
+    pub rel_path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+pub fn extract_zip_to_dir(
+    file_path: &Path,
+    extract_root: &Path,
+    keep_zip: bool,
+    max_unpacked_bytes: Option<u64>,
+) -> Result<()> {
+    debug!(
+        "Extract start zip={} dest={} keep_zip={} max_unpacked_bytes={:?}",
+        file_path.display(),
+        extract_root.display(),
+        keep_zip,
+        max_unpacked_bytes
+    );
+    let file = File::open(file_path)
+        .with_context(|| format!("Failed to open zip {}", file_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("Invalid zip {}", file_path.display()))?;
+
+    let mut total_unpacked: u64 = 0;
+
+    for i in 0..archive.len() {
+        let file = archive.by_index(i)?;
+        if is_symlink(&file) {
+            continue;
+        }
+        let name = file.name();
+        if is_junk_entry(name) {
+            continue;
+        }
+        let relative = sanitize_path(name);
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        if !file.is_dir() {
+            total_unpacked = total_unpacked.saturating_add(file.size());
+            if let Some(max_bytes) = max_unpacked_bytes {
+                if total_unpacked > max_bytes {
+                    return Err(anyhow::anyhow!(
+                        "Archive exceeds max unpacked size ({} bytes)",
+                        max_bytes
+                    ));
+                }
+            }
+        }
+    }
+
+    fs::create_dir_all(extract_root)
+        .with_context(|| format!("Failed to create {}", extract_root.display()))?;
+
+    let mut extracted_files = 0usize;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if is_symlink(&entry) {
+            continue;
+        }
+        let name = entry.name().to_string();
+        if is_junk_entry(&name) {
+            continue;
+        }
+        let relative = sanitize_path(&name);
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let out_path = extract_root.join(&relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&out_path).ok();
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+
+        if out_path.exists() {
+            if out_path.is_dir() {
+                fs::remove_dir_all(&out_path).ok();
+            } else {
+                fs::remove_file(&out_path).ok();
+            }
+        }
+
+        trace!("Extract file {} -> {}", name, out_path.display());
+        let mut outfile = File::create(&out_path)
+            .with_context(|| format!("Failed to create file {}", out_path.display()))?;
+        std::io::copy(&mut entry, &mut outfile)
+            .with_context(|| format!("Failed to extract {}", name))?;
+        extracted_files += 1;
+    }
+
+    clean_junk(extract_root)?;
+    let mut visited = HashSet::new();
+    extract_nested_zips(extract_root, keep_zip, max_unpacked_bytes, &mut visited)?;
+
+    if !keep_zip {
+        fs::remove_file(file_path).ok();
+    }
+
+    debug!(
+        "Extract complete zip={} files={} total_unpacked={} bytes",
+        file_path.display(),
+        extracted_files,
+        total_unpacked
+    );
+    Ok(())
+}
+
+pub fn index_extracted_files(root: &Path) -> Result<Vec<IndexedFile>> {
+    let mut files = Vec::new();
+    if !root.is_dir() {
+        return Ok(files);
+    }
+
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if !entry.path().is_file() {
+            continue;
+        }
+        let rel = match entry.path().strip_prefix(root) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if is_junk_path(rel) {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let sha256 = hash_file(entry.path())?;
+        files.push(IndexedFile {
+            rel_path: path_to_slash(rel),
+            size,
+            sha256,
+        });
+    }
+
+    Ok(files)
 }
 
 #[allow(dead_code)]
@@ -97,18 +243,25 @@ pub fn normalize_repo_flatten(root: &Path, dry_run: bool) -> Result<usize> {
 }
 
 #[derive(Debug, Clone)]
-pub struct PartGroup {
-    pub base_name: String,
+pub struct MergeMapping {
+    pub part_path: PathBuf,
     pub base_path: PathBuf,
-    pub part_paths: Vec<PathBuf>,
 }
 
-pub fn find_part_groups(root: &Path) -> Result<Vec<PartGroup>> {
+pub fn derive_part_base(name: &str) -> Option<String> {
+    split_part_suffix(name).map(|(base, _)| base)
+}
+
+pub fn merge_part_folders(
+    root: &Path,
+    dry_run: bool,
+    overwrite: bool,
+) -> Result<Vec<MergeMapping>> {
     if !root.is_dir() {
         return Ok(Vec::new());
     }
 
-    let mut groups: std::collections::HashMap<String, Vec<PathBuf>> = std::collections::HashMap::new();
+    let mut part_folders: Vec<(PathBuf, String)> = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
@@ -116,89 +269,53 @@ pub fn find_part_groups(root: &Path) -> Result<Vec<PartGroup>> {
             continue;
         }
         let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
-        if let Some((base, _)) = split_part_suffix(name) {
-            groups.entry(base).or_default().push(path);
+        if let Some(base) = derive_part_base(name) {
+            part_folders.push((path, base));
         }
     }
 
-    let mut out = Vec::new();
-    for (base, mut parts) in groups {
+    let mut mappings = Vec::new();
+    let mut remaining: Vec<(PathBuf, String)> = Vec::new();
+
+    for (part_path, base_name) in part_folders {
+        let base_path = root.join(&base_name);
+        if base_path.is_dir() {
+            if merge_single_part(&part_path, &base_path, dry_run, overwrite)? {
+                mappings.push(MergeMapping {
+                    part_path,
+                    base_path,
+                });
+            }
+        } else {
+            remaining.push((part_path, base_name));
+        }
+    }
+
+    let mut grouped: std::collections::HashMap<String, Vec<PathBuf>> = std::collections::HashMap::new();
+    for (part_path, base_name) in remaining {
+        grouped.entry(base_name).or_default().push(part_path);
+    }
+
+    for (base_name, parts) in grouped {
         if parts.len() < 2 {
             continue;
         }
-        parts.sort();
-        out.push(PartGroup {
-            base_name: base.clone(),
-            base_path: root.join(&base),
-            part_paths: parts,
-        });
-    }
-    Ok(out)
-}
-
-pub fn merge_part_group(group: &PartGroup, dry_run: bool) -> Result<bool> {
-    let base_path = &group.base_path;
-    if base_path.exists() && !base_path.is_dir() {
-        warn!("Skip merge {}: base path is not a directory", base_path.display());
-        return Ok(false);
-    }
-
-    let mut used: HashSet<PathBuf> = HashSet::new();
-    if base_path.exists() {
-        for entry in WalkDir::new(base_path).into_iter().filter_map(Result::ok) {
-            if entry.path().is_file() {
-                if let Ok(rel) = entry.path().strip_prefix(base_path) {
-                    used.insert(rel.to_path_buf());
-                }
+        let base_path = root.join(&base_name);
+        if !dry_run {
+            fs::create_dir_all(&base_path)
+                .with_context(|| format!("Failed to create {}", base_path.display()))?;
+        }
+        for part_path in parts {
+            if merge_single_part(&part_path, &base_path, dry_run, overwrite)? {
+                mappings.push(MergeMapping {
+                    part_path,
+                    base_path: base_path.clone(),
+                });
             }
         }
     }
 
-    for part in &group.part_paths {
-        for entry in WalkDir::new(part).into_iter().filter_map(Result::ok) {
-            if entry.path().is_file() {
-                let rel = match entry.path().strip_prefix(part) {
-                    Ok(rel) => rel.to_path_buf(),
-                    Err(_) => continue,
-                };
-                if used.contains(&rel) {
-                    warn!(
-                        "Skip merge {}: conflict on {}",
-                        group.base_name,
-                        rel.display()
-                    );
-                    return Ok(false);
-                }
-                used.insert(rel);
-            }
-        }
-    }
-
-    if dry_run {
-        return Ok(true);
-    }
-
-    fs::create_dir_all(base_path)
-        .with_context(|| format!("Failed to create {}", base_path.display()))?;
-
-    for part in &group.part_paths {
-        for entry in WalkDir::new(part).into_iter().filter_map(Result::ok) {
-            if entry.path().is_file() {
-                let rel = match entry.path().strip_prefix(part) {
-                    Ok(rel) => rel,
-                    Err(_) => continue,
-                };
-                let dest = base_path.join(rel);
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent).ok();
-                }
-                move_file(entry.path(), &dest)?;
-            }
-        }
-        fs::remove_dir_all(part).ok();
-    }
-
-    Ok(true)
+    Ok(mappings)
 }
 
 fn split_part_suffix(name: &str) -> Option<(String, u32)> {
@@ -216,6 +333,71 @@ fn split_part_suffix(name: &str) -> Option<(String, u32)> {
         return None;
     }
     Some((base, num))
+}
+
+fn merge_single_part(part_path: &Path, base_path: &Path, dry_run: bool, overwrite: bool) -> Result<bool> {
+    if !can_merge_without_conflicts(part_path, base_path)? && !overwrite {
+        warn!(
+            "Skip merge into {}: conflict detected",
+            base_path.display()
+        );
+        return Ok(false);
+    }
+    if dry_run {
+        return Ok(true);
+    }
+    fs::create_dir_all(base_path)
+        .with_context(|| format!("Failed to create {}", base_path.display()))?;
+    merge_folder_contents(part_path, base_path, overwrite)?;
+    Ok(true)
+}
+
+fn can_merge_without_conflicts(part_path: &Path, base_path: &Path) -> Result<bool> {
+    if !base_path.exists() {
+        return Ok(true);
+    }
+    for entry in WalkDir::new(part_path).into_iter().filter_map(Result::ok) {
+        if entry.path().is_file() {
+            let rel = match entry.path().strip_prefix(part_path) {
+                Ok(rel) => rel,
+                Err(_) => continue,
+            };
+            let dest = base_path.join(rel);
+            if dest.exists() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn merge_folder_contents(from_dir: &Path, to_dir: &Path, overwrite: bool) -> Result<()> {
+    for entry in WalkDir::new(from_dir).into_iter().filter_map(Result::ok) {
+        if entry.path().is_file() {
+            let rel = match entry.path().strip_prefix(from_dir) {
+                Ok(rel) => rel,
+                Err(_) => continue,
+            };
+            let dest = to_dir.join(rel);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            if dest.exists() {
+                if overwrite {
+                    if dest.is_dir() {
+                        fs::remove_dir_all(&dest).ok();
+                    } else {
+                        fs::remove_file(&dest).ok();
+                    }
+                } else {
+                    continue;
+                }
+            }
+            move_file(entry.path(), &dest)?;
+        }
+    }
+    fs::remove_dir_all(from_dir).ok();
+    Ok(())
 }
 
 fn move_file(from: &Path, to: &Path) -> Result<()> {
@@ -478,6 +660,41 @@ fn is_junk_entry(name: &str) -> bool {
         || name.ends_with(".DS_Store")
 }
 
+fn is_junk_path(path: &Path) -> bool {
+    for comp in path.components() {
+        if let Component::Normal(part) = comp {
+            if part == "__MACOSX" {
+                return true;
+            }
+        }
+    }
+    if path.file_name().and_then(|v| v.to_str()) == Some(".DS_Store") {
+        return true;
+    }
+    false
+}
+
+pub fn hash_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)
+        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{:02x}", byte);
+    }
+    Ok(out)
+}
+
 fn is_supplement_name(name: &str) -> bool {
     name.starts_with("Gridded") || name.starts_with("Gridless") || name.starts_with("Supplement")
 }
@@ -495,11 +712,13 @@ fn clean_junk(target: &Path) -> Result<()> {
         let path = entry.path();
         if path.is_dir() {
             if path.file_name().and_then(|v| v.to_str()) == Some("__MACOSX") {
+                trace!("Remove junk dir {}", path.display());
                 fs::remove_dir_all(path).ok();
             }
             continue;
         }
         if path.file_name().and_then(|v| v.to_str()) == Some(".DS_Store") {
+            trace!("Remove junk file {}", path.display());
             fs::remove_file(path).ok();
         }
     }
@@ -530,10 +749,75 @@ fn extract_nested_zips(
         if !visited.insert(key) {
             continue;
         }
+        debug!("Extract nested zip {}", zip_path.display());
         let extracted = extract_zip_inner(&zip_path, parent, keep_zip, max_unpacked_bytes, visited)?;
         let _ = extracted;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let base = std::env::temp_dir();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            for attempt in 0..20u32 {
+                let candidate = base.join(format!(
+                    "czepeku-test-{}-{}-{}",
+                    prefix,
+                    std::process::id(),
+                    now + attempt as u128
+                ));
+                if candidate.exists() {
+                    continue;
+                }
+                fs::create_dir_all(&candidate).expect("create tempdir");
+                return Self { path: candidate };
+            }
+            panic!("Failed to create temp dir");
+        }
+
+        fn path(&self) -> &PathBuf {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn index_extracted_files_skips_junk() {
+        let dir = TempDir::new("extract");
+        let macosx = dir.path().join("__MACOSX");
+        fs::create_dir_all(&macosx).unwrap();
+        File::create(macosx.join("._junk")).unwrap();
+        File::create(dir.path().join(".DS_Store")).unwrap();
+        let map_dir = dir.path().join("Map");
+        fs::create_dir_all(&map_dir).unwrap();
+        let mut file = File::create(map_dir.join("file.txt")).unwrap();
+        file.write_all(b"hello").unwrap();
+
+        let files = index_extracted_files(dir.path()).expect("index");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].rel_path, "Map/file.txt");
+    }
 }
 
 fn create_temp_dir(target: &Path) -> Result<PathBuf> {

@@ -10,7 +10,13 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "https://kemono.cr", help = "Kemono base URL")]
     pub base_url: String,
 
-    #[arg(long, global = true, default_value = "cookies.txt", help = "Path to cookies.txt for kemono.cr")]
+    #[arg(
+        long,
+        global = true,
+        num_args = 0..=1,
+        default_missing_value = "cookies.txt",
+        help = "Optional path to cookies.txt for kemono.cr (use --cookies to enable; omit to disable)"
+    )]
     pub cookies: Option<PathBuf>,
 
     #[arg(long, global = true, help = "Path to users_posts.json (default: ./users_posts.json)")]
@@ -37,6 +43,22 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false, help = "Disable log file output")]
     pub no_log_file: bool,
 
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 50,
+        help = "Rotate log file when it exceeds this size in MB (0 to disable)"
+    )]
+    pub log_max_mb: u64,
+
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 5,
+        help = "Number of rotated log backups to keep"
+    )]
+    pub log_backups: usize,
+
     #[arg(long, global = true, help = "Max total unpacked size in MB (default: unlimited)")]
     pub max_unpacked_mb: Option<u64>,
 
@@ -48,6 +70,17 @@ pub struct Cli {
 
     #[arg(long, global = true, default_value_t = 10)]
     pub max_backoff: u64,
+
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 1800,
+        help = "Download timeout in seconds (0 to disable)"
+    )]
+    pub download_timeout_seconds: u64,
+
+    #[arg(long, global = true, help = "Minimum delay between HTTP requests (ms)")]
+    pub min_request_interval_ms: Option<u64>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -62,6 +95,7 @@ pub enum Commands {
     Repair(RepairArgs),
     Remove(RemoveArgs),
     Normalize(NormalizeArgs),
+    Reset(ResetArgs),
 }
 
 #[derive(Args, Debug)]
@@ -94,11 +128,17 @@ pub struct DownloadArgs {
     #[arg(long, default_value_t = false, help = "Download all indexed attachments")]
     pub all: bool,
 
+    #[arg(long, default_value_t = false, help = "Return success even if some downloads fail")]
+    pub allow_failures: bool,
+
+    #[arg(long, default_value_t = false, help = "Force re-download even if marked completed/merged")]
+    pub force: bool,
+
     #[arg(long)]
     pub keep_zip: bool,
 
-    #[arg(long, default_value_t = 4)]
-    pub workers: usize,
+    #[arg(long, help = "Number of parallel workers (default: heuristic)")]
+    pub workers: Option<usize>,
 
     #[arg(long, default_value_t = 1000)]
     pub limit: usize,
@@ -141,9 +181,12 @@ pub struct RemoveArgs {
 pub struct NormalizeArgs {
     #[arg(long, default_value_t = false, help = "Preview changes without modifying files")]
     pub dry_run: bool,
+}
 
-    #[arg(long = "no-merge", action = clap::ArgAction::SetFalse, default_value_t = true, help = "Disable merging Part folders")]
-    pub merge: bool,
+#[derive(Args, Debug)]
+pub struct ResetArgs {
+    #[arg(long, default_value_t = false, help = "Confirm destructive reset")]
+    pub yes: bool,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
